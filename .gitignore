@@ -1,0 +1,5 @@
+/target
+.omo/
+.codegraph/
+toast-dump.txt
+prompt.txt
