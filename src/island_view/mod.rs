@@ -140,6 +140,10 @@ pub struct IslandView {
     drag_origin: Option<i32>,
     /// Window left edge when that drag started.
     window_origin: Option<i32>,
+    /// A horizontal slide is scheduled. Its task moves the window after the
+    /// current event dispatch ends: a move made inside the dispatch commits
+    /// synchronously, and gpui panics when that nested move crosses displays.
+    slide_pending: bool,
     /// Global mouse hook. The line is click-through, so the window itself
     /// cannot see the pointer enter the trigger.
     pointer: Option<PointerWatch>,
@@ -194,6 +198,7 @@ impl IslandView {
             seen_toasts: std::collections::HashSet::new(),
             drag_origin: None,
             window_origin: None,
+            slide_pending: false,
             pointer: None,
             hidden: false,
             exclusive: false,
@@ -779,7 +784,7 @@ impl IslandView {
             let through = view.state == IslandState::Line && hover == Hover::Outside;
             crate::pointer::set_click_through(window_hwnd(window), through);
             if view.drag_origin.is_some() && view.seek_drag.is_none() {
-                slide_horizontally(view, window);
+                schedule_slide(view, cx);
             }
             view.apply_hover(hover, cx);
             let seekable = view.now_playing.seekable && view.now_playing.duration_secs > 0 && !media::seek_refused();
@@ -1077,25 +1082,69 @@ fn lerp(start: Morph, end: Morph, progress: f32) -> Morph {
 /// position is recomputed every move and stops when the button comes up.
 /// `SWP_NOZORDER` keeps this move out of the z-order. The tray thread owns
 /// topmost.
-fn slide_horizontally(view: &IslandView, window: &mut Window) {
-    let (Some(start), Some(origin), Some(cursor)) = (view.drag_origin, view.window_origin, cursor_x()) else {
+///
+/// The move itself runs after this event dispatch ends, never inside it.
+/// `SetWindowPos` commits before it returns, so Windows delivers `WM_MOVE`
+/// re-entrantly while gpui still holds the `App` borrow for this mouse-move
+/// event. On one monitor the nested `on_moved` reporter survives that with a
+/// `try_borrow` and logs the failure, so same-screen drags work. When the
+/// slide carries the window's center onto another display, the nested
+/// `on_display_changed` reporter calls `AsyncApp::update` instead, whose plain
+/// `borrow_mut` panics with `RefCell already borrowed`: the crash seen when a
+/// drag crosses two screens. Scheduling the move on the foreground executor
+/// mirrors how gpui itself defers `on_appearance_changed` for the same reason.
+fn schedule_slide(view: &mut IslandView, cx: &mut Context<IslandView>) {
+    if view.slide_pending {
         return;
-    };
-    let hwnd = window_hwnd(window);
-    let top = physical_origin_y(window);
-    unsafe {
-        let _moved = windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            origin.saturating_add(cursor.saturating_sub(start)),
-            top,
-            0,
-            0,
-            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-        );
     }
+    view.slide_pending = true;
+    cx.spawn(async move |view, cx| {
+        let plan = view
+            .update(cx, |view, cx| {
+                view.slide_pending = false;
+                let start = view.drag_origin?;
+                let origin = view.window_origin?;
+                // The nested `handle.update` re-enters the borrow this update
+                // already holds, exactly as `poll_pointer` does.
+                let placed = cx.windows().first().and_then(|handle| {
+                    handle
+                        .update(cx, |_root, window, _cx| {
+                            (window_hwnd(window), physical_origin_y(window))
+                        })
+                        .ok()
+                })?;
+                Some((start, origin, placed))
+            })
+            .ok()
+            .flatten();
+        let Some((start, origin, (hwnd, top))) = plan else {
+            return;
+        };
+        if hwnd.is_null() {
+            return;
+        }
+        let Some(cursor) = cursor_x() else {
+            return;
+        };
+        // The borrow from the event dispatch is released by now. Windows may
+        // then report the move through `WM_MOVE` and, onto another display,
+        // `WM_DPICHANGED` and a display-change report; with nothing borrowed
+        // all those nested `update` calls succeed cleanly.
+        unsafe {
+            let _moved = windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                origin.saturating_add(cursor.saturating_sub(start)),
+                top,
+                0,
+                0,
+                windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+        }
+    })
+    .detach();
 }
 
 fn cursor_x() -> Option<i32> {
