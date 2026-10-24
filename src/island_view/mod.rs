@@ -1126,15 +1126,35 @@ fn schedule_slide(view: &mut IslandView, cx: &mut Context<IslandView>) {
         let Some(cursor) = cursor_x() else {
             return;
         };
-        // The borrow from the event dispatch is released by now. Windows may
-        // then report the move through `WM_MOVE` and, onto another display,
-        // `WM_DPICHANGED` and a display-change report; with nothing borrowed
-        // all those nested `update` calls succeed cleanly.
+        let x = origin.saturating_add(cursor.saturating_sub(start));
+        let mut rect = windows_sys::Win32::Foundation::RECT::default();
+        // SAFETY: `rect` is a valid target for `GetWindowRect`, which reads
+        // the window's physical frame.
+        let measured = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                hwnd,
+                std::ptr::from_mut(&mut rect),
+            )
+        };
+        if measured == 0 {
+            return;
+        }
+        let width = rect.right.saturating_sub(rect.left);
+        // The snap tracks the horizontal center of where the window is being
+        // placed, not the pointer: half the window or more must be on the
+        // next screen before the top line follows it.
+        let center_x = x.saturating_add(width / 2);
+        let top = rustedge::island::slide_top(center_x, &monitor_spans()).unwrap_or(top);
+        // SAFETY: `hwnd` is this GPUI window, and the move has only the
+        // screen-top snap above it. Windows may answer with `WM_MOVE`, and
+        // onto another scale, `WM_DPICHANGED`; nothing is borrowed here, so
+        // gpui handles those nested reports cleanly.
+        let before_dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
         unsafe {
             let _moved = windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
-                origin.saturating_add(cursor.saturating_sub(start)),
+                x,
                 top,
                 0,
                 0,
@@ -1143,8 +1163,86 @@ fn schedule_slide(view: &mut IslandView, cx: &mut Context<IslandView>) {
                     | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
             );
         }
+        // Crossing screens of different scale lets Windows reposition the
+        // window from its suggested `WM_DPICHANGED` rect, which can pull the
+        // top off the screen edge. Pin the top back once, after that reflow.
+        let after_dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+        if after_dpi != before_dpi {
+            // SAFETY: same window as above; the nested reflow has finished.
+            unsafe {
+                let _pinned = windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    x,
+                    top,
+                    0,
+                    0,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                        | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                        | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
+        }
     })
     .detach();
+}
+
+/// Every display's span and top, in physical pixels, for the slide snap.
+///
+/// `EnumDisplayMonitors` walks the virtual screen on the main thread. A
+/// monitor that fails its info read contributes nothing; an empty list
+/// leaves the top where it is.
+fn monitor_spans() -> Vec<rustedge::island::MonitorSpan> {
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows_sys::core::BOOL;
+
+    // Appends one monitor's physical `rcMonitor` when its info read succeeds.
+    unsafe extern "system" fn on_monitor(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        state: LPARAM,
+    ) -> BOOL {
+        if state == 0 {
+            return 0;
+        }
+        // SAFETY: `state` was handed to `EnumDisplayMonitors` pointing at the
+        // caller's local `Vec`, which outlives this enumeration.
+        let spans = unsafe { &mut *(state as *mut Vec<rustedge::island::MonitorSpan>) };
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or_default(),
+            // SAFETY: a zeroed `MONITORINFO` with `cbSize` set is exactly the
+            // contract `GetMonitorInfoW` documents.
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: `monitor` is valid for the enumeration, and `info` has
+        // `cbSize` set as `GetMonitorInfoW` requires.
+        let read = unsafe { GetMonitorInfoW(monitor, std::ptr::from_mut(&mut info)) };
+        if read == 0 {
+            return 1;
+        }
+        spans.push(rustedge::island::MonitorSpan {
+            left: info.rcMonitor.left,
+            right: info.rcMonitor.right,
+            top: info.rcMonitor.top,
+        });
+        1
+    }
+    let mut spans = Vec::new();
+    // SAFETY: no device context, the whole virtual screen is walked, and the
+    // callback's state points at local storage that outlives the call.
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            Some(on_monitor),
+            std::ptr::from_mut(&mut spans) as isize,
+        );
+    }
+    spans
 }
 
 fn cursor_x() -> Option<i32> {

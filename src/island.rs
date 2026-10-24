@@ -17,6 +17,8 @@
 //!    A vertical wheel without Alt is volume, decided in `volume`.
 //! 6. [`needs_topmost_raise`] and [`wants_exclusive_hide`] plus [`HideLatch`]
 //!    are the tray thread's whole z-order policy.
+//! 7. [`slide_top`] names the top edge of the screen a horizontal drag has
+//!    crossed into, from the physical monitor spans the view enumerates.
 //!
 //! Sizes are logical pixels. Integer frame fields stay exact; the morph uses
 //! `f32` because it is interpolated.
@@ -550,6 +552,57 @@ pub const fn stage_frame(display_width: u32) -> IslandFrame {
     }
 }
 
+/// Horizontal span and top edge of one monitor, in physical pixels.
+///
+/// `right` is exclusive, so a half-past-the-edge center reads as one pixel
+/// out of the band.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MonitorSpan {
+    /// Left edge, inclusive.
+    pub left: i32,
+    /// Right edge, exclusive.
+    pub right: i32,
+    /// Top edge.
+    pub top: i32,
+}
+
+/// Top edge for the overlay once a slide puts its horizontal center at
+/// `center_x`.
+///
+/// Dragging is horizontal, and screens can be misaligned vertically, so the
+/// center's current y takes no part: the monitor whose horizontal span holds
+/// the center — otherwise the one whose edge is nearest to it — owns the top
+/// line. Re-deriving on every slide gives the pass-over-half rule for free:
+/// until the center crosses, the home screen still owns the top; after it
+/// does, the new screen does, and dragging back restores the home screen.
+/// `None` when `monitors` is empty; the caller keeps the current top then.
+///
+/// Ties keep the first span, which is the stable enumeration order, so a
+/// center resting on an exact boundary cannot flicker between screens.
+#[must_use]
+pub fn slide_top(center_x: i32, monitors: &[MonitorSpan]) -> Option<i32> {
+    let chosen = monitors
+        .iter()
+        .copied()
+        .min_by_key(|span| slide_distance(*span, center_x))?;
+    Some(chosen.top)
+}
+
+/// How far `center_x` sits outside `span`'s horizontal band.
+///
+/// Zero inside the band; a distance past whichever edge it left. The math
+/// stays in `i64` because the difference wraps in `i32`,
+/// `i32::MIN - i32::MAX`-range inputs being the general case it must survive.
+fn slide_distance(span: MonitorSpan, center_x: i32) -> i64 {
+    if center_x < span.left {
+        i64::from(span.left) - i64::from(center_x)
+    } else if center_x >= span.right {
+        i64::from(center_x) - i64::from(span.right)
+    } else {
+        0
+    }
+}
+
 /// How many pixels a marquee edge takes to go from clear to solid.
 /// One point six ems at the 13px capsule face.
 const MARQUEE_FADE_PX: f32 = 1.6 * 13.0;
@@ -633,6 +686,7 @@ mod tests {
         CAPSULE_MAX, CAPSULE_MIN, parse_launcher,
         FULLSCREEN_DEBOUNCE_MS, HideLatch, LayerSample, needs_topmost_raise, wants_exclusive_hide,
         seek_fill_px, seek_column_px, seek_fraction, seek_origin_x, over_seek,
+        MonitorSpan, slide_distance, slide_top,
     };
 
     fn near(actual: f32, expected: f32) {
@@ -908,6 +962,56 @@ mod tests {
         assert_eq!(next_track(2), 0);
         assert_eq!(previous_track(0), 2);
         assert_eq!(TRACKS.len(), 3);
+    }
+
+    #[test]
+    fn slide_top_follows_the_screen_the_center_has_entered() {
+        // Secondary screen to the right, its top lower than the primary's.
+        let monitors = [
+            MonitorSpan { left: -2560, right: 0, top: 0 },
+            MonitorSpan { left: 1920, right: 3840, top: 2160 },
+        ];
+        // Center on the primary keeps the primary top.
+        assert_eq!(slide_top(-1280, &monitors), Some(0));
+        // Half the stage has crossed onto the secondary: its top wins.
+        assert_eq!(slide_top(3270, &monitors), Some(2160));
+    }
+
+    #[test]
+    fn slide_top_snaps_back_when_the_center_recrosses() {
+        let monitors = [
+            MonitorSpan { left: 0, right: 2560, top: 0 },
+            MonitorSpan { left: 2560, right: 4480, top: -700 },
+        ];
+        // On the higher secondary, top at its edge.
+        assert_eq!(slide_top(3500, &monitors), Some(-700));
+        // Dragged back onto the primary: the primary top returns.
+        assert_eq!(slide_top(1200, &monitors), Some(0));
+    }
+
+    #[test]
+    fn slide_top_picks_the_nearest_edge_across_a_gap() {
+        let monitors = [
+            MonitorSpan { left: 0, right: 1000, top: 100 },
+            MonitorSpan { left: 1600, right: 2600, top: 50 },
+        ];
+        // Center in the dead band, 590 from the left screen, 10 from the
+        // right screen's left edge.
+        assert_eq!(slide_top(1590, &monitors), Some(50));
+    }
+
+    #[test]
+    fn slide_top_keeps_nothing_without_monitors() {
+        assert_eq!(slide_top(0, &[]), None);
+    }
+
+    #[test]
+    fn slide_distance_is_zero_inside_the_band() {
+        let span = MonitorSpan { left: 10, right: 110, top: 0 };
+        assert_eq!(slide_distance(span, 10), 0);
+        assert_eq!(slide_distance(span, 109), 0);
+        // Fifty-nine past the exclusive right edge.
+        assert_eq!(slide_distance(span, 168), 58);
     }
 
 }
