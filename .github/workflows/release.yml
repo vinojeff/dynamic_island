@@ -1,0 +1,77 @@
+# Build, package, and publish rustedge releases.
+#
+# Tag a version (`git tag v0.1.0 && git push origin v0.1.0`) to get a GitHub
+# Release with a zip of the Windows build. The workflow also runs from the
+# Actions page ("workflow_dispatch"); a manual run packages the current commit
+# and falls back to the version in Cargo.toml for the tag name.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  package:
+    name: Build and release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Decide version
+        id: meta
+        shell: pwsh
+        run: |
+          if ([string]::Equals($env:GITHUB_REF_TYPE, "tag")) {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+            $tag = "v$version"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip=rustedge-$tag-windows-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha=rustedge-$tag-windows-x64.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "dist/${{ steps.meta.outputs.zip }}"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path target/release/rustedge.exe -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "$hash  ${{ steps.meta.outputs.zip }}" | Out-File -FilePath "dist/${{ steps.meta.outputs.sha }}" -Encoding ascii
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          files: |
+            dist/${{ steps.meta.outputs.zip }}
+            dist/${{ steps.meta.outputs.sha }}
+          fail_on_unmatched_files: true
