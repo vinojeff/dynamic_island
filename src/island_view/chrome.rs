@@ -323,10 +323,19 @@ fn faded_line(line: &ShapedLine, offset_px: f32) -> gpui_kit::Div {
             alpha,
         })
         .collect();
-    div().size_full().child(gpui_kit::canvas(
+    div().size_full().child(glyph_canvas(placed))
+}
+
+/// The placed glyphs as a full-bleed canvas. `size_full` is load-bearing: a
+/// canvas with no size lays out at height 0 in a plain div, and the paint
+/// clip then hides every glyph (probe: `marquee_layout_probe::the_marquee_canvas_fills_its_shell`).
+#[must_use]
+fn glyph_canvas(placed: Vec<PaintedGlyph>) -> gpui_kit::Canvas<Vec<PaintedGlyph>> {
+    gpui_kit::canvas(
         move |_bounds, _window, _app| placed,
         move |bounds, placed, window, _app| paint_glyphs(bounds, &placed, window),
-    ))
+    )
+    .size_full()
 }
 
 struct PaintedGlyph {
@@ -340,7 +349,7 @@ fn paint_glyphs(bounds: Bounds<Pixels>, glyphs: &[PaintedGlyph], window: &mut Wi
     // Same vertical slot as the solid text element: a 20px line box holding a
     // 13px face. The shaper's ascent is the font metric, not that slot, and
     // using it pushed the glyphs below the clip.
-    let baseline = f32::from(bounds.origin.y) + (20.0 + TEXT_PX) / 2.0;
+    let baseline = f32::from(bounds.origin.y) + f32::midpoint(20.0, TEXT_PX);
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for glyph in glyphs {
             let origin = Point { x: px(f32::from(bounds.origin.x) + glyph.x), y: px(baseline) };
@@ -555,3 +564,49 @@ fn speaker(icon: volume::VolumeIcon) -> gpui_kit::Div {
             row.child(div().w(px(2.0)).h(px(12.0)).bg(rgb(0x00ff_5a5a)))
         })
 }
+
+#[cfg(test)]
+mod marquee_layout_probe {
+    use gpui_kit::{IntoElement, ParentElement, Styled, div, point, px, size};
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A bare canvas inside a sized div lays out at height 0, and the
+    /// glyph paint clips itself to that empty canvas. The regression is a
+    /// full-bleed canvas: its bounds must match the wrapper it lives in.
+    #[gpui_kit::test]
+    fn the_marquee_canvas_fills_its_shell(cx: &mut gpui_kit::TestAppContext) {
+        let measured = Rc::new(Cell::new((0.0f32, 0.0f32)));
+        cx.add_empty_window().draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(40.0)),
+            |_window, _app| {
+                let measured = measured.clone();
+                div()
+                    .ml(px(12.0))
+                    .h(px(20.0))
+                    .overflow_hidden()
+                    .relative()
+                    .child(
+                        div()
+                            .size_full()
+                            .on_children_prepainted(move |children, _window, _app| {
+                                if let Some(bounds) = children.last() {
+                                    measured.set((
+                                        bounds.size.width.into(),
+                                        bounds.size.height.into(),
+                                    ));
+                                }
+                            })
+                            .child(super::glyph_canvas(Vec::new())),
+                    )
+                    .into_any_element()
+            },
+        );
+        let (width, height) = measured.get();
+        assert!((height - 20.0).abs() < 0.01, "canvas height {height} does not fill the 20px shell");
+        assert!(width > 0.0, "canvas width {width} does not fill the shell");
+    }
+}
+
