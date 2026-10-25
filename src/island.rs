@@ -57,17 +57,22 @@ pub const PILL_WIDTH: f32 = 220.0;
 /// Width of the tucked line. It spans the stage.
 pub const LINE_WIDTH: f32 = 420.0;
 
-/// Height of the tucked line.
-pub const LINE_HEIGHT: f32 = 1.5;
+/// Thickness of the tucked line at its center. The ends taper to
+/// [`LINE_TIP_HEIGHT`].
+pub const LINE_HEIGHT: f32 = 6.0;
+
+/// Thickness of the tucked line at its two ends.
+pub const LINE_TIP_HEIGHT: f32 = 0.9;
 
 /// Corner radius of the tucked line.
-pub const LINE_RADIUS: f32 = 2.0;
+pub const LINE_RADIUS: f32 = LINE_HEIGHT / 2.0;
 
 /// How far below the tucked line the pointer still counts as hovering it.
 ///
-/// The line is 1.5px tall. A deeper band opens the capsule before the pointer
-/// reaches the line, around where the capsule itself would sit.
-pub const LINE_HOVER_DEPTH: f32 = 8.0;
+/// The line is 6px thick, so most of this is margin below it: the pointer does
+/// not have to be pressed against the screen edge. Deepening it widens the
+/// strip at the top of the screen that the dock claims while it is tucked.
+pub const LINE_HOVER_DEPTH: f32 = 24.0;
 
 /// How far below the window's top edge the pointer still counts as hovering the capsule.
 pub const HOVER_DEPTH: f32 = 80.0;
@@ -87,7 +92,7 @@ pub const TUCK_MS: u64 = 280;
 /// The three presentations of the island. The card is sticky; the capsule is not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IslandState {
-    /// A 4px line parked on the top edge.
+    /// A thin glass line parked on the top edge.
     Line,
     /// The hover capsule.
     Capsule,
@@ -106,20 +111,27 @@ pub enum Hover {
 
 /// Classifies a window-local pointer against the shape that is actually showing.
 ///
-/// A line is the full stage width and only `LINE_HOVER_DEPTH` tall, so the
-/// capsule does not open until the pointer is on the line. A capsule uses the
-/// wider, deeper band. Coordinates outside the stage are outside.
+/// A line is the full stage width and only [`LINE_HOVER_DEPTH`] tall, so the
+/// capsule does not open until the pointer is on the line. A capsule adds its
+/// own wider, deeper band, but the line's band stays live: opening the capsule
+/// from either end of the line must not tuck it again, or the two bands would
+/// hand the pointer back and forth. Coordinates outside the stage are outside.
 #[must_use]
 pub fn hover_at(state: IslandState, x: f32, y: f32) -> Hover {
     #[allow(clippy::cast_precision_loss)]
     let center = (STAGE_WIDTH as f32) / 2.0;
-    let (half_width, depth) = match state {
-        IslandState::Line => (LINE_WIDTH / 2.0, LINE_HOVER_DEPTH),
-        IslandState::Capsule | IslandState::Card => (HOVER_HALF_WIDTH, HOVER_DEPTH),
-    };
-    let inside =
-        (0.0..=depth).contains(&y) && x >= center - half_width && x <= center + half_width;
-    if inside { Hover::Inside } else { Hover::Outside }
+    let on_line = (0.0..=LINE_HOVER_DEPTH).contains(&y)
+        && x >= center - LINE_WIDTH / 2.0
+        && x <= center + LINE_WIDTH / 2.0;
+    let in_capsule = state != IslandState::Line
+        && (0.0..=HOVER_DEPTH).contains(&y)
+        && x >= center - HOVER_HALF_WIDTH
+        && x <= center + HOVER_HALF_WIDTH;
+    if on_line || in_capsule {
+        Hover::Inside
+    } else {
+        Hover::Outside
+    }
 }
 
 /// Whether a window-local pointer is inside the card, which is larger than the hover band.
@@ -728,8 +740,23 @@ mod tests {
         assert_eq!(hover_at(IslandState::Capsule, center - 110.0, 40.0), Hover::Inside);
         assert_eq!(hover_at(IslandState::Capsule, center + 110.0, 40.0), Hover::Inside);
         assert_eq!(hover_at(IslandState::Capsule, center, HOVER_DEPTH + 1.0), Hover::Outside);
-        assert_eq!(hover_at(IslandState::Capsule, center - 111.0, 10.0), Hover::Outside);
+        assert_eq!(
+            hover_at(IslandState::Capsule, center - 111.0, LINE_HOVER_DEPTH + 1.0),
+            Hover::Outside
+        );
         assert_eq!(hover_at(IslandState::Capsule, -1.0, 10.0), Hover::Outside);
+    }
+
+    #[test]
+    fn the_line_band_stays_live_under_an_open_capsule() {
+        // Opening the capsule at either end of the line must not tuck it again:
+        // the pointer is still on the line, so both states must agree.
+        assert_eq!(hover_at(IslandState::Line, 10.0, 10.0), Hover::Inside);
+        assert_eq!(hover_at(IslandState::Capsule, 10.0, 10.0), Hover::Inside);
+        assert_eq!(
+            hover_at(IslandState::Capsule, 10.0, LINE_HOVER_DEPTH + 1.0),
+            Hover::Outside
+        );
     }
 
     #[test]

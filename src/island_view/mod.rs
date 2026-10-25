@@ -451,10 +451,13 @@ impl IslandView {
         let Some((origin_x, origin_y, scale)) = placed else {
             return;
         };
+        // Signed on purpose: a pointer left of or above the stage is outside it.
+        // Clamping the difference to zero put every point left of the window on
+        // the line's left edge, so the whole top-left of the screen opened it.
         #[allow(clippy::cast_precision_loss)]
-        let x = point.x.saturating_sub(origin_x) as f32 / scale;
+        let x = (i64::from(point.x) - i64::from(origin_x)) as f32 / scale;
         #[allow(clippy::cast_precision_loss)]
-        let y = point.y.saturating_sub(origin_y) as f32 / scale;
+        let y = (i64::from(point.y) - i64::from(origin_y)) as f32 / scale;
         let hover = island::hover_at(self.state, x, y);
         if self.seek_drag.is_some() {
             self.move_seek(x, cx);

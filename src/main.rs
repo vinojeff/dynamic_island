@@ -44,8 +44,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_SYSMENU, WS_THICKFRAME,
+    SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW, WS_SYSMENU, WS_THICKFRAME,
 };
 use gpui_kit::{
     App, AppContext, Bounds, Fill, Pixels, Styled, Window, WindowBackgroundAppearance,
@@ -149,13 +149,12 @@ fn open_island(app: &mut App, commands: std::sync::mpsc::Receiver<tray::Command>
         is_minimizable: false,
         display_id: Some(display.id()),
         window_background: WindowBackgroundAppearance::Transparent,
-        window_min_size: Some(bounds.size),
         ..Default::default()
     };
 
     let (window, _view) = gpui_kit::open_window(options, app, |window, cx| {
         // Before the window is shown the DWM frame may not exist yet.
-        hide_system_border(window);
+        hide_system_border(window, bounds);
         cx.new(|cx| {
             let view = IslandView::new();
             cx.defer_in(window, |view: &mut IslandView, _window, cx| {
@@ -178,7 +177,7 @@ fn open_island(app: &mut App, commands: std::sync::mpsc::Receiver<tray::Command>
             cx.notify(root.entity_id());
             // The window is on screen now, so DWM will honor the border color.
             // Hide then show drops the taskbar button the first show registered.
-            hide_system_border(window);
+            hide_system_border(window, bounds);
             show_without_taskbar(window);
             tray::watch_layer(window_hwnd(window));
         })
@@ -206,8 +205,11 @@ fn window_hwnd(window: &Window) -> windows_sys::Win32::Foundation::HWND {
 /// `DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE` only recolors it, and Windows restores
 /// the color on activation (zed-industries/zed#61508). Clearing the frame styles
 /// and sending `SWP_FRAMECHANGED` makes `WM_NCCALCSIZE` give the whole window to
-/// the client area. Failures are ignored.
-fn hide_system_border(window: &mut Window) {
+/// the client area. GPUI placed the window as if the caption still existed, so
+/// the stage rect is applied again afterwards: with no frame, the window rect
+/// is the client rect. Failures are ignored.
+fn hide_system_border(window: &mut Window, bounds: Bounds<Pixels>) {
+    let scale = window.scale_factor();
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -228,6 +230,18 @@ fn hide_system_border(window: &mut Window) {
     let tool = WS_EX_TOOLWINDOW as isize;
     #[allow(clippy::cast_possible_wrap)]
     let app = WS_EX_APPWINDOW as isize;
+    // The stage rectangle, in the physical pixels Win32 places windows in.
+    // GPUI's own placement uses a border offset that this window does not have
+    // (its client starts at the frame's top edge), so the stage lands a frame
+    // width above the screen. This is the rect that puts it back.
+    #[allow(clippy::cast_possible_truncation)]
+    let stage_x = (f32::from(bounds.origin.x) * scale).round() as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let stage_y = (f32::from(bounds.origin.y) * scale).round() as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let stage_width = (f32::from(bounds.size.width) * scale).round() as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let stage_height = (f32::from(bounds.size.height) * scale).round() as i32;
     unsafe {
         let _status = DwmSetWindowAttribute(hwnd, attribute, std::ptr::from_ref(&color).cast(), size);
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -243,7 +257,7 @@ fn hide_system_border(window: &mut Window) {
         // SWP_FRAMECHANGED is required or the taskbar keeps the old frame.
         // HWND_TOPMOST once at show. The tray thread reasserts it afterwards;
         // a single call here loses to the next fullscreen window.
-        let _moved = SetWindowPos(
+        let _frame_changed = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
             0,
@@ -251,6 +265,17 @@ fn hide_system_border(window: &mut Window) {
             0,
             0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        // With the frame gone the window rectangle is the client rectangle, so
+        // the stage rect lands the content flush with the display again.
+        let _placed = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            stage_x,
+            stage_y,
+            stage_width,
+            stage_height,
+            SWP_NOACTIVATE,
         );
     }
 }

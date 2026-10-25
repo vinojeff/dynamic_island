@@ -81,6 +81,10 @@ where
     let page_next = Rc::new(page_next);
     let playing = if tab == Tab::Media { media_playing } else { playing };
     let ink = rgb(0x00f5_f5f7);
+    // The tucked line paints its own tapered glass lens instead of the shell.
+    if shape.height < 12.0 {
+        return line_glass(shape.width);
+    }
     let body = div()
         .flex_1()
         .w_full()
@@ -88,8 +92,7 @@ where
         .when(state == IslandState::Capsule || state == IslandState::Card, |body| {
             body.cursor_pointer().on_mouse_down(MouseButton::Left, toggle)
         })
-        .when(state == IslandState::Line && shape.height < 12.0, |body| body.child(edge_line()))
-        .when(state != IslandState::Card && shape.height >= 12.0, |body| {
+        .when(state != IslandState::Card, |body| {
             if volume_visible && volume.available {
                 body.child(volume_overlay(volume, mute))
             } else {
@@ -171,8 +174,100 @@ fn thumb(image: std::sync::Arc<gpui_kit::RenderImage>) -> gpui_kit::Img {
         .object_fit(gpui_kit::ObjectFit::Cover)
 }
 
-fn edge_line() -> gpui_kit::Div {
-    div().size_full()
+/// Vertical room the glass line paints into. The bloom needs more than the
+/// 6px core, and a canvas clips its paint to its own bounds.
+const LINE_BAND_HEIGHT: f32 = 28.0;
+
+/// Cool white-cyan. A plain white hairline reads as chrome; this reads as glass.
+const GLASS_HUE: f32 = 0.54;
+
+/// The tucked line: a lens that tapers from [`island::LINE_TIP_HEIGHT`] at the
+/// ends to [`island::LINE_HEIGHT`] at the center, with a faint bloom around a
+/// bright core.
+fn line_glass(width: f32) -> gpui_kit::Div {
+    div().w(px(width)).h(px(LINE_BAND_HEIGHT)).child(
+        gpui_kit::canvas(
+            |_, _, _| (),
+            |bounds, (), window, _| paint_glass_line(bounds, window),
+        )
+        .size_full(),
+    )
+}
+
+fn paint_glass_line(bounds: Bounds<Pixels>, window: &mut Window) {
+    if f32::from(bounds.size.width) < 1.0 {
+        return;
+    }
+    // Widest and faintest first: each bloom layer is a thicker copy of the lens.
+    // The outer layers carry the cyan cast that makes the line read as neon.
+    for (extra, color) in [
+        (26.0, hsla(GLASS_HUE, 0.85, 0.70, 0.030)),
+        (18.0, hsla(GLASS_HUE, 0.75, 0.80, 0.045)),
+        (11.0, hsla(GLASS_HUE, 0.55, 0.90, 0.070)),
+        (5.0, hsla(GLASS_HUE, 0.35, 0.97, 0.100)),
+    ] {
+        paint_lens(bounds, |unit| core_thickness(unit) + extra, color, window);
+    }
+    // Frosted body, still translucent so the wallpaper shows through.
+    paint_lens(
+        bounds,
+        core_thickness,
+        hsla(GLASS_HUE, 0.35, 0.97, 0.62),
+        window,
+    );
+    // Specular filament down the middle of the glass.
+    paint_lens(
+        bounds,
+        |unit| 0.5 + 1.1 * taper(unit),
+        hsla(GLASS_HUE, 0.12, 1.0, 0.92),
+        window,
+    );
+}
+
+fn core_thickness(unit: f32) -> f32 {
+    island::LINE_TIP_HEIGHT + (island::LINE_HEIGHT - island::LINE_TIP_HEIGHT) * taper(unit)
+}
+
+/// Smooth bell: `0.0` at the two ends, `1.0` at the center.
+fn taper(unit: f32) -> f32 {
+    let bell = (std::f32::consts::PI * unit.clamp(0.0, 1.0)).sin();
+    bell * bell
+}
+
+/// Fill one lens: `thickness` is sampled across the width and mirrored about
+/// the core's horizontal axis.
+#[allow(clippy::cast_precision_loss)]
+fn paint_lens(
+    bounds: Bounds<Pixels>,
+    thickness: impl Fn(f32) -> f32,
+    color: gpui_kit::Hsla,
+    window: &mut Window,
+) {
+    const STEPS: usize = 96;
+    let width = f32::from(bounds.size.width);
+    let left = f32::from(bounds.origin.x);
+    let middle = f32::from(bounds.origin.y) + island::LINE_HEIGHT / 2.0;
+    let mut lens = gpui_kit::PathBuilder::fill();
+    for step in 0..=STEPS {
+        let unit = step as f32 / STEPS as f32;
+        let at = point(px(left + unit * width), px(middle - thickness(unit) / 2.0));
+        if step == 0 {
+            lens.move_to(at);
+        } else {
+            lens.line_to(at);
+        }
+    }
+    for step in (0..=STEPS).rev() {
+        let unit = step as f32 / STEPS as f32;
+        lens.line_to(point(
+            px(left + unit * width),
+            px(middle + thickness(unit) / 2.0),
+        ));
+    }
+    lens.close();
+    if let Ok(lens) = lens.build() {
+        window.paint_path(lens, color);
+    }
 }
 
 struct CapsuleEnds {
