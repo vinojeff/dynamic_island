@@ -158,20 +158,25 @@ pub(super) fn frost(
 /// The shell's underlay layers: scrim, specular sheen, rim, dispersion.
 ///
 /// Painted ahead of the body so text and controls sit on top of the glass.
+/// Each layer carries the shell's own corner radius: gpui's overflow mask is
+/// a plain rectangle (`ContentMask { bounds }`), so the silhouette has to
+/// come from every layer's own rounded background — same as [`frost`] clips
+/// through `paint_image`'s radii.
+///
 /// With no backdrop yet, the scrim is the fallback wash — a thin two-stop
 /// gradient standing in until the frosted crop arrives.
 pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Vec<gpui_kit::Div> {
     let luma = glass.map_or(IDLE_LUMA, |(_, luma)| luma);
     let seeded = glass.is_some();
-    let scrim = div().absolute().inset_0();
+    let shape = div().absolute().inset_0().rounded(px(radius));
     let scrim = if seeded {
-        scrim.bg(linear_gradient(
+        shape.bg(linear_gradient(
             180.0,
             linear_color_stop(hsla(0.0, 0.0, 0.05, scrim_alpha(luma)), 0.0),
             linear_color_stop(hsla(0.0, 0.0, 0.04, scrim_alpha(luma)), 1.0),
         ))
     } else {
-        scrim.bg(linear_gradient(
+        shape.bg(linear_gradient(
             180.0,
             linear_color_stop(hsla(0.0, 0.0, 0.05, 0.62), 0.0),
             linear_color_stop(hsla(0.0, 0.0, 0.04, 0.48), 1.0),
@@ -179,16 +184,24 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
     };
     // The sheen. GPUI gradients take exactly two stops, so the three-stop
     // streak is two stacked divs meeting at the transparent midpoint.
-    let sheen_high = div().absolute().inset_0().bg(linear_gradient(
-        SPECULAR_ANGLE,
-        linear_color_stop(hsla(0.0, 1.0, 1.0, 0.10), 0.0),
-        linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
-    ));
-    let sheen_low = div().absolute().inset_0().bg(linear_gradient(
-        SPECULAR_ANGLE,
-        linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
-        linear_color_stop(hsla(0.0, 1.0, 1.0, 0.03), 1.0),
-    ));
+    let sheen_high = div()
+        .absolute()
+        .inset_0()
+        .rounded(px(radius))
+        .bg(linear_gradient(
+            SPECULAR_ANGLE,
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.10), 0.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
+        ));
+    let sheen_low = div()
+        .absolute()
+        .inset_0()
+        .rounded(px(radius))
+        .bg(linear_gradient(
+            SPECULAR_ANGLE,
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.03), 1.0),
+        ));
     let rim = div().absolute().inset_0().child(canvas(
         |_, _, _| (),
         move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
