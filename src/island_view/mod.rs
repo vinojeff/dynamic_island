@@ -50,6 +50,8 @@ use rustedge::island::{
 };
 use rustedge::volume::{self, Endpoint, Reading, VolumeCommand, VolumeState};
 
+/// The liquid-glass optics: frost underlay, scrim, sheen, rim, dispersion.
+mod glass;
 mod chrome;
 mod media_page;
 
