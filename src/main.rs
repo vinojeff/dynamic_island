@@ -33,6 +33,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// The frosted wallpaper backdrop the liquid glass sits on.
+mod wallpaper;
+
 mod island_view;
 mod perf_view;
 mod pointer;

@@ -53,7 +53,7 @@ windows = { version = "0.62", features = [
 ] }
 windows-core = "0.62"
 windows-implement = "0.60"
-image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25.9", default-features = false, features = ["bmp", "png", "jpeg"] }
 smallvec = "1"
 sysinfo = { version = "0.37", default-features = false, features = ["system", "network"] }
 
