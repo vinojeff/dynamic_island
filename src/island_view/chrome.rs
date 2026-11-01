@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{
-    Animation, AnimationExt, App, Bounds, BoxShadow, ContentMask, Font, FontStyle, FontWeight,
+    Animation, AnimationExt, App, Bounds, ContentMask, Font, FontStyle, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
     SharedString, Styled, StyledImage, TextRun, Window, div, hsla, point, prelude::FluentBuilder,
     px, rgb,
@@ -71,7 +71,7 @@ where
     let Face {
         shape, playing, tab, volume, volume_visible, state, notice, badge, media_line,
         media_playing, cover, progress, position_secs, duration_secs, track_hot, album_line,
-        transport, modes, sessions, seekable, sessions_open, perf, page_slide,
+        transport, modes, sessions, seekable, sessions_open, perf, page_slide, glass, glass_luma,
     } = face.clone();
     let title = match notice.as_ref() {
         Some(item) => notice::marquee_text(item),
@@ -129,6 +129,9 @@ where
             }))
         });
 
+    // The liquid-glass shell: backdrop optics first (they sit under the body),
+    // then the body, then the transport row for the media card.
+    let glass_pair = glass.as_ref().map(|image| (image, glass_luma));
     let shell = div()
         .w(px(shape.width))
         .h(px(shape.height))
@@ -136,19 +139,11 @@ where
         .flex_col()
         .overflow_hidden()
         .rounded(px(shape.radius))
-        .bg(shell_fill(state))
         .text_color(ink)
         .when(state != IslandState::Line, |shell| {
             shell
-                .border_1()
-                .border_color(hsla(0.0, 0.0, 1.0, 0.12))
-                .shadow(vec![BoxShadow {
-                    color: hsla(0.0, 0.0, 0.0, 0.40),
-                    offset: point(px(0.0), px(16.0)),
-                    blur_radius: px(48.0),
-                    spread_radius: px(0.0),
-                    inset: false,
-                }])
+                .shadow(super::glass::shell_shadows())
+                .children(super::glass::layers(shape.radius, glass_pair))
         })
         .child(body);
 
@@ -156,13 +151,6 @@ where
         shell.child(controls(playing, transport, previous, play, next))
     } else {
         shell
-    }
-}
-
-fn shell_fill(state: IslandState) -> gpui_kit::Hsla {
-    match state {
-        IslandState::Line => hsla(0.0, 0.0, 1.0, 0.35),
-        IslandState::Capsule | IslandState::Card => hsla(0.0, 0.0, 0.078, 0.55),
     }
 }
 

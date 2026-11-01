@@ -137,14 +137,20 @@ pub(super) fn frost(
     let radius = px(shape.radius);
     base.child(canvas(
         |_, _, _| (),
-        move |bounds: Bounds<Pixels>, _: (), window: &mut Window, _: &mut App| {
+        move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
             let shell = Bounds::new(
                 point(bounds.origin.x + px(shell_offset(width)), bounds.origin.y),
                 size(px(width), px(height)),
             );
             // Slide the wallpaper crop into window space, clipped to the shell.
-            let _painted =
-                window.paint_image(shell, bounds, Corners::all(radius), Arc::clone(&image), 0, false);
+            let _painted = window.paint_image(
+                shell,
+                bounds,
+                Corners::all(radius),
+                Arc::clone(&image),
+                0,
+                false,
+            );
         },
     ))
 }
@@ -154,10 +160,7 @@ pub(super) fn frost(
 /// Painted ahead of the body so text and controls sit on top of the glass.
 /// With no backdrop yet, the scrim is the fallback wash — a thin two-stop
 /// gradient standing in until the frosted crop arrives.
-pub(super) fn layers(
-    radius: f32,
-    glass: Option<(&Arc<RenderImage>, f32)>,
-) -> Vec<gpui_kit::Div> {
+pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Vec<gpui_kit::Div> {
     let luma = glass.map_or(IDLE_LUMA, |(_, luma)| luma);
     let seeded = glass.is_some();
     let scrim = div().absolute().inset_0();
@@ -188,7 +191,7 @@ pub(super) fn layers(
     ));
     let rim = div().absolute().inset_0().child(canvas(
         |_, _, _| (),
-        move |bounds: Bounds<Pixels>, _: (), window: &mut Window, _: &mut App| {
+        move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
             paint_rim(bounds, radius, window);
         },
     ));
@@ -201,8 +204,16 @@ pub(super) fn layers(
 /// traced backwards so the hole stays a hole instead of a second fill.
 fn paint_rim(bounds: Bounds<Pixels>, radius: f32, window: &mut Window) {
     // The Fresnel falloff: three white bands, bright at the very edge.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "RIM_BANDS is 3; the quotient is exact in f32"
+    )]
+    let band_width = REFRACTION_WIDTH / RIM_BANDS as f32;
     for band in 0..RIM_BANDS {
-        let band_width = REFRACTION_WIDTH / RIM_BANDS as f32;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "the band index is a small integer"
+        )]
         let inset = band as f32 * band_width;
         paint_ring(
             bounds,
@@ -244,13 +255,23 @@ fn paint_ring(
     color: gpui_kit::Hsla,
     window: &mut Window,
 ) {
-    let x = f32::from(bounds.origin.x);
-    let y = f32::from(bounds.origin.y);
-    let w = f32::from(bounds.size.width);
-    let h = f32::from(bounds.size.height);
-    let outer = (x + inset, y + inset, w - 2.0 * inset, h - 2.0 * inset);
+    let left = f32::from(bounds.origin.x);
+    let top = f32::from(bounds.origin.y);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    let outer = (
+        left + inset,
+        top + inset,
+        width - 2.0 * inset,
+        height - 2.0 * inset,
+    );
     let deep = inset + band;
-    let inner = (x + deep, y + deep, w - 2.0 * deep, h - 2.0 * deep);
+    let inner = (
+        left + deep,
+        top + deep,
+        width - 2.0 * deep,
+        height - 2.0 * deep,
+    );
     if outer.2 <= 0.0 || outer.3 <= 0.0 || inner.2 <= 0.0 || inner.3 <= 0.0 {
         return;
     }
@@ -276,25 +297,35 @@ fn paint_ring(
 }
 
 /// Samples one rounded-rect contour clockwise (or backwards) at four arcs.
-#[allow(clippy::cast_precision_loss)]
-fn walk_rounded(rect: (f32, f32, f32, f32), radius: f32, reverse: bool) -> Vec<gpui_kit::Point<Pixels>> {
-    let (x, y, w, h) = rect;
-    let r = radius.min(w / 2.0).min(h / 2.0);
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "geometry floats: the values are window-sized, far under f32's \
+              24-bit mantissa"
+)]
+fn walk_rounded(
+    rect: (f32, f32, f32, f32),
+    radius: f32,
+    reverse: bool,
+) -> Vec<gpui_kit::Point<Pixels>> {
     const ARC_STEPS: usize = 8;
+    let (left, top, width, height) = rect;
+    let edge = radius.min(width / 2.0).min(height / 2.0);
     let mut points = Vec::with_capacity(4 * ARC_STEPS + 4);
     // Corner centers, clockwise from the top-right.
     let centers = [
-        (x + w - r, y + r),
-        (x + w - r, y + h - r),
-        (x + r, y + h - r),
-        (x + r, y + r),
+        (left + width - edge, top + edge),
+        (left + width - edge, top + height - edge),
+        (left + edge, top + height - edge),
+        (left + edge, top + edge),
     ];
-    for (index, (cx, cy)) in centers.iter().enumerate() {
+    for (index, (corner_x, corner_y)) in centers.iter().enumerate() {
         for step in 0..=ARC_STEPS {
-            #[allow(clippy::cast_precision_loss)]
-            let t = -std::f32::consts::FRAC_PI_2
+            let angle = -std::f32::consts::FRAC_PI_2
                 + (index as f32 + step as f32 / ARC_STEPS as f32) * std::f32::consts::FRAC_PI_2;
-            points.push(point(px(cx + r * t.cos()), px(cy + r * t.sin())));
+            points.push(point(
+                px(corner_x + edge * angle.cos()),
+                px(corner_y + edge * angle.sin()),
+            ));
         }
     }
     if reverse {
@@ -325,7 +356,10 @@ mod tests {
 
     #[test]
     fn shell_offset_centers_the_capsule_and_zeros_the_card() {
-        near(shell_offset(PILL_WIDTH), island::STAGE_WIDTH as f32 / 2.0 - PILL_WIDTH / 2.0);
+        near(
+            shell_offset(PILL_WIDTH),
+            island::STAGE_WIDTH as f32 / 2.0 - PILL_WIDTH / 2.0,
+        );
         near(shell_offset(CARD_WIDTH), 0.0);
         // A mid-morph width stays symmetric about the center.
         let mid = 320.0;

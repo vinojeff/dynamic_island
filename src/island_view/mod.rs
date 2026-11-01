@@ -32,6 +32,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::{
@@ -42,6 +43,7 @@ use gpui_kit::{
 
 use crate::pointer::{PointerWatch, ScreenPoint};
 use crate::toasts;
+use crate::wallpaper;
 use rustedge::media::{self, NowPlaying};
 use rustedge::notice::{Content, Notice, Queue};
 use rustedge::perf::{self, PerfHistory};
@@ -87,6 +89,10 @@ struct Face {
     sessions_open: bool,
     perf: PerfHistory,
     page_slide: f32,
+    /// The frosted wallpaper crop, when a build has landed.
+    glass: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    /// Lightness behind the glass; `glass::layers` turns it into scrim depth.
+    glass_luma: f32,
 }
 
 /// One morph already on screen, so the next animation knows where it starts.
@@ -155,6 +161,22 @@ pub struct IslandView {
     exclusive: bool,
     /// Physical top-left of the stage, captured from a window callback.
     stage_origin: Option<ScreenPoint>,
+    /// The frosted wallpaper crop. `None` until the first background build
+    /// lands (the shell shows the fallback wash for one or two seconds after
+    /// start — intended, see `glass::layers`).
+    glass: Option<std::sync::Arc<wallpaper::GlassBackdrop>>,
+    /// A build is running on the background executor. Children polls skip
+    /// until it lands; a rect that moved mid-build self-heals on the next
+    /// poll, so no epoch ticket is needed here.
+    glass_building: bool,
+    /// The last fingerprint the view processed, success or failure. Polling
+    /// compares against this, not against a success, so a broken wallpaper
+    /// never re-decodes on every pass.
+    glass_fingerprint: Option<wallpaper::Fingerprint>,
+    /// Bumped whenever a poll schedules a build; completions compare against
+    /// the epoch they captured so a stale one cannot overwrite a snapshot
+    /// taken for a later rect.
+    glass_epoch: u64,
     /// Toasts waiting to preempt media. Empty means the media source.
     notices: Queue,
     /// Last SMTC snapshot. Idle until the first poll returns.
@@ -205,6 +227,10 @@ impl IslandView {
             hidden: false,
             exclusive: false,
             stage_origin: None,
+            glass: None,
+            glass_building: false,
+            glass_fingerprint: None,
+            glass_epoch: 0,
             notices: Queue::new(),
             now_playing: NowPlaying::idle(),
             tray: None,
@@ -377,6 +403,24 @@ impl IslandView {
             }
         })
         .detach();
+        // The glass watch. A two-second cadence is plenty: slideshow
+        // wallpapers land within one tick, and the SPI + stat check costs
+        // micro on the background executor.
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let continued = view
+                    .update(cx, |view, cx| {
+                        view.poll_glass(cx);
+                        true
+                    })
+                    .is_ok();
+                if !continued {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn remember_stage(&mut self, window: &Window) {
@@ -386,6 +430,92 @@ impl IslandView {
             pressed: false,
             released: false,
         });
+    }
+
+    /// Refreshes the frosted glass when the wallpaper or the stage moved.
+    ///
+    /// One comparison per tick. When the fingerprint moves — the wallpaper
+    /// file, or the window's physical rect after a slide or a DPI change —
+    /// the full decode runs off-thread and the result lands through
+    /// `view.update`. A failed build still stores its fingerprint: a broken
+    /// wallpaper must not re-decode every tick. (The rect is what the
+    /// fingerprint carries, not the scale; across a DPI boundary the physical
+    /// rect changes by itself.)
+    fn poll_glass(&mut self, cx: &mut Context<Self>) {
+        if self.glass_building {
+            return;
+        }
+        let placed = cx.windows().first().and_then(|handle| {
+            handle.update(cx, |_root, window, _cx| {
+                let scale = window.scale_factor().max(1.0);
+                (
+                    physical_origin_x(window),
+                    physical_origin_y(window),
+                    scale,
+                )
+            }).ok()
+        });
+        let Some((origin_x, origin_y, scale)) = placed else {
+            return;
+        };
+        // The stage is exactly the window rect on screen.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the stage is at most a couple thousand logical pixels, and \
+                      physical size rounds down a sub-pixel edge harmless to a \
+                      blurred crop"
+        )]
+        let rect = (
+            origin_x,
+            origin_y,
+            (island::STAGE_WIDTH as f32 * scale) as u32,
+            (island::STAGE_HEIGHT as f32 * scale) as u32,
+        );
+        let epoch = self.glass_epoch();
+        cx.spawn(async move |view, cx| {
+            let snapshot =
+                cx.background_executor().spawn(async move { wallpaper::fingerprint_now(rect) }).await;
+            // A stale epoch or an unchanged fingerprint cancels the build.
+            let started = view.update(cx, |view, _cx| {
+                if view.glass_epoch == epoch && snapshot != view.glass_fingerprint {
+                    view.glass_building = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !started.is_ok_and(|started| started) {
+                return;
+            }
+            let built = cx
+                .background_executor()
+                .spawn(async move {
+                    let screen = wallpaper::screen_size();
+                    wallpaper::build(screen, rect)
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                if view.glass_epoch != epoch {
+                    return;
+                }
+                view.glass_building = false;
+                // Stored on failure too: None backdrop, recorded fingerprint.
+                view.glass_fingerprint = snapshot;
+                view.glass = built.map(std::sync::Arc::new);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Bumped by the poller whenever a new build gets scheduled, so a stale
+    /// completion cannot overwrite a snapshot taken for a later rect.
+    fn glass_epoch(&mut self) -> u64 {
+        self.glass_epoch = self.glass_epoch.saturating_add(1);
+        self.glass_epoch
     }
 
     fn poll_tray(&mut self, cx: &mut Context<Self>) {
@@ -650,6 +780,8 @@ impl IslandView {
             sessions_open: self.sessions_open,
             perf: self.perf.clone(),
             page_slide: self.page_slide,
+            glass: self.glass.as_ref().map(|backdrop| Arc::clone(&backdrop.image)),
+            glass_luma: self.glass.as_ref().map_or(glass::IDLE_LUMA, |backdrop| backdrop.luma),
         }
     }
 
@@ -730,8 +862,12 @@ impl IslandView {
         };
         let _ = &card_clicks;
 
+        // The morphing shape is what the frost must track; the resting shape
+        // covers the no-motion frame. Tucked, the frost paints nothing.
+        let mut frost_shape = resting(self.state);
         let island = if let Some(motion) = motion.filter(|motion| motion.generation == generation) {
             let (shape, raw) = frame_shape(&motion);
+            frost_shape = shape;
             if raw < 1.0 {
                 let ticket = generation;
                 cx.spawn(async move |view, cx| {
@@ -834,6 +970,12 @@ impl IslandView {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                 view.on_arrow(event, cx);
             }))
+            // The frost paints first so the shell sits on top of it.
+            .child(glass::frost(
+                frost_shape,
+                self.state,
+                self.glass.as_ref().map(|backdrop| &backdrop.image),
+            ))
             .child(island)
     }
 }

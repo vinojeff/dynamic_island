@@ -21,7 +21,7 @@ use std::time::UNIX_EPOCH;
 
 use gpui_kit::RenderImage;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SystemParametersInfoW, SPI_GETDESKWALLPAPER,
+    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETDESKWALLPAPER, SystemParametersInfoW,
 };
 
 /// Box-blur radius, physical pixels. Three passes of this approximate a
@@ -88,6 +88,10 @@ fn fingerprint_file(path: &str, rect: (i32, i32, u32, u32)) -> Option<Fingerprin
 fn wallpaper_path() -> Option<String> {
     let mut buffer = [0u16; 1024];
     // SAFETY: the buffer lives for the call and the action only writes to it.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "1024 is far below u32::MAX"
+    )]
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETDESKWALLPAPER,
@@ -103,7 +107,7 @@ fn wallpaper_path() -> Option<String> {
     if end == 0 {
         return None;
     }
-    Some(String::from_utf16_lossy(&buffer[..end]))
+    Some(String::from_utf16_lossy(buffer.get(..end)?))
 }
 
 /// Physical display size the wallpaper currently covers. Primary monitor.
@@ -111,8 +115,16 @@ fn wallpaper_path() -> Option<String> {
 pub fn screen_size() -> (u32, u32) {
     // SAFETY: GetSystemMetrics has no precondition beyond an initialized
     // desktop, which a windowed process has.
-    (unsafe { GetSystemMetrics(SM_CXSCREEN) } as u32, unsafe {
-        GetSystemMetrics(SM_CYSCREEN) } as u32)
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "screen metrics are non-negative; a negative reply reads as 0"
+    )]
+    {
+        (
+            unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(0) as u32,
+            unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(0) as u32,
+        )
+    }
 }
 
 /// Builds the frosted crop for one stage rect.
@@ -146,13 +158,15 @@ pub fn build(display: (u32, u32), rect: (i32, i32, u32, u32)) -> Option<GlassBac
     if w == 0 || h == 0 {
         return None;
     }
-    let mut crop_raw = image::imageops::crop_imm(&stretched, x, y, w, h).to_image().into_raw();
+    let mut crop_raw = image::imageops::crop_imm(&stretched, x, y, w, h)
+        .to_image()
+        .into_raw();
     let cw = w as usize;
     let ch = h as usize;
     blur3(&mut crop_raw, cw, ch, BLUR_RADIUS);
     saturate(&mut crop_raw, SATURATION);
     let luma = mean_luma(&crop_raw);
-    let frame = frame_from_rgba(cw, ch, crop_raw)?;
+    let frame = frame_from_rgba(cw, ch, &crop_raw)?;
     Some(GlassBackdrop {
         image: Arc::new(RenderImage::new(smallvec::smallvec![frame])),
         luma,
@@ -190,6 +204,21 @@ pub fn map_rect(
 }
 
 /// One box-blur pass over one axis. RGBA, alpha passed through.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every index is provably in bounds: `base + m*step + c` spans \
+              exactly one row (horizontal: base scales the row, step 4) or one \
+              column (vertical: base the column, step `w*4`), because `line` \
+              runs over the OTHER axis and `m`/`head`/`tail` are clamped below \
+              `major`; the tests pin both passes end-to-end"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "accumulators stay small and well below f32's 24-bit mantissa, \
+              averages are 0..=255 before rounding off negative values"
+)]
 fn blur_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize, horizontal: bool) {
     let (major, minor) = if horizontal { (w, h) } else { (h, w) };
     let line_stride = w * 4;
@@ -197,7 +226,11 @@ fn blur_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize, hori
     for line in 0..minor {
         // Sliding window per channel; RGB only, alpha copies through. A line
         // is a row for horizontal passes and a column for vertical ones.
-        let base = if horizontal { line * line_stride } else { line * 4 };
+        let base = if horizontal {
+            line * line_stride
+        } else {
+            line * 4
+        };
         let mut sums = [0f32; 3];
         let initial = radius.min(major - 1);
         for off in 0..=initial {
@@ -247,9 +280,22 @@ pub fn blur3(buffer: &mut [u8], w: usize, h: usize, radius: usize) {
 /// Scales RGB saturation by `factor` around each pixel's luma, clamped.
 ///
 /// 1.0 changes nothing; extremes clamp to their own channel range.
+/// Scales RGB saturation by `factor` around each pixel's luma, clamped.
+///
+/// 1.0 changes nothing; extremes clamp to their own channel range.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "inputs are 0..=255 and every result clamps to that range \
+              before the narrowing cast"
+)]
 pub fn saturate(buffer: &mut [u8], factor: f32) {
     for chunk in buffer.chunks_exact_mut(4) {
-        let (r, g, b) = (f32::from(chunk[0]), f32::from(chunk[1]), f32::from(chunk[2]));
+        let [r, g, b, ..] = *chunk else {
+            continue;
+        };
+        let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
         let luma = 0.299 * r + 0.587 * g + 0.114 * b;
         for (slot, value) in chunk.iter_mut().take(3).zip([r, g, b]) {
             *slot = (luma + (value - luma) * factor).round().clamp(0.0, 255.0) as u8;
@@ -267,9 +313,10 @@ pub fn mean_luma(buffer: &[u8]) -> f32 {
     let total: f64 = buffer
         .chunks_exact(4)
         .map(|chunk| {
-            0.299 * f64::from(chunk[0])
-                + 0.587 * f64::from(chunk[1])
-                + 0.114 * f64::from(chunk[2])
+            let [r, g, b, ..] = *chunk else {
+                return 0.0;
+            };
+            0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
         })
         .sum();
     #[allow(
@@ -284,7 +331,7 @@ pub fn mean_luma(buffer: &[u8]) -> f32 {
 /// Swaps RGB to BGRA and wraps one opaque frame, the exact construction
 /// `media::decode_cover` uses so color order stays consistent app-wide. The
 /// caller wraps the frame in a [`RenderImage`].
-fn frame_from_rgba(width: usize, height: usize, rgba: Vec<u8>) -> Option<image::Frame> {
+fn frame_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<image::Frame> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -295,11 +342,12 @@ fn frame_from_rgba(width: usize, height: usize, rgba: Vec<u8>) -> Option<image::
         };
         bgra.extend_from_slice(&[blue, green, red, alpha]);
     }
-    let buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-        width as u32,
-        height as u32,
-        bgra,
-    )?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "dimensions came from a decoded image's u32 fields"
+    )]
+    let buffer =
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, bgra)?;
     Some(image::Frame::new(buffer))
 }
 
@@ -395,10 +443,7 @@ mod tests {
 
     #[test]
     fn the_fingerprint_moves_when_the_file_or_rect_moves() {
-        let dir = std::env::temp_dir().join(format!(
-            "rustedge-fingerprint-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rustedge-fingerprint-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("wall.png");
         std::fs::write(&file, tiny_png([[1, 2, 3, 255]; 4])).unwrap();
@@ -411,7 +456,10 @@ mod tests {
 
         // Force the mtime so a rewrite is observable at second resolution.
         let old = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let handle = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        let handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
         handle
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();
@@ -422,10 +470,7 @@ mod tests {
         let moved = fingerprint_file(&path, (900, 0, 420, 360));
         assert_ne!(first, moved, "a moved stage rect is a new fingerprint");
 
-        let vanished = fingerprint_file(
-            &dir.join("missing.png").to_string_lossy(),
-            rect,
-        );
+        let vanished = fingerprint_file(&dir.join("missing.png").to_string_lossy(), rect);
         assert!(vanished.is_none(), "a vanished file has no fingerprint");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -437,10 +482,7 @@ mod tests {
         // file that fails to decode must yield the same fingerprint on every
         // pass whether or not the build succeeded, or the poll would re-decode
         // the broken file every second forever.
-        let dir = std::env::temp_dir().join(format!(
-            "rustedge-failbuild-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rustedge-failbuild-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let file = dir.join("garbage.png");
         std::fs::write(&file, b"not an image at all").unwrap();
@@ -463,14 +505,14 @@ mod tests {
         blur3(&mut raw, 42, 42, 3);
         saturate(&mut raw, 1.15);
         assert_eq!(raw[0], 10, "constant gray survives both passes");
-        let frame = frame_from_rgba(42, 42, raw).unwrap();
+        let frame = frame_from_rgba(42, 42, &raw).unwrap();
         assert_eq!(frame.buffer().width(), 42);
         assert_eq!(frame.buffer().height(), 42);
     }
 
     #[test]
     fn frame_from_rgba_swaps_to_bgra() {
-        let frame = frame_from_rgba(1, 1, vec![9, 8, 7, 255]).unwrap();
+        let frame = frame_from_rgba(1, 1, &[9, 8, 7, 255]).unwrap();
         // The typed slot reads [b, g, r] after the swap: blue=7 first.
         let pixel = frame.buffer().get_pixel(0, 0).0;
         assert_eq!(pixel[0], 7, "first slot is B after the swap");
