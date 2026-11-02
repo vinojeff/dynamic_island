@@ -17,11 +17,13 @@ use std::collections::VecDeque;
 
 use gpui_kit::{
     App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, Styled, Window, canvas, div, hsla, point,
+    MouseDownEvent, ParentElement, SharedString, Styled, Window, canvas, div, point,
     prelude::FluentBuilder, px, rgb,
 };
 
 use rustedge::perf::{self, PerfHistory};
+
+use crate::theme;
 
 /// Performance page: clock on the title row, then CPU, memory, and network.
 pub(crate) fn perf_page(history: &PerfHistory, now_ms: u64) -> gpui_kit::Div {
@@ -56,13 +58,13 @@ pub(crate) fn perf_page(history: &PerfHistory, now_ms: u64) -> gpui_kit::Div {
 }
 
 /// CPU stroke. Fill is the same color at 20% alpha.
-const CPU: u32 = 0x0089_b4fa;
+const CPU: u32 = 0x003b_6fd6;
 /// Memory stroke.
-const MEM: u32 = 0x00a6_e3a1;
+const MEM: u32 = 0x002e_8b57;
 /// Network upload stroke.
-const NET_UP: u32 = 0x00f9_e2af;
+const NET_UP: u32 = 0x00a2_6a12;
 /// Network download stroke.
-const NET_DOWN: u32 = 0x0089_dceb;
+const NET_DOWN: u32 = 0x001f_7f96;
 
 fn title_row(now_ms: u64) -> gpui_kit::Div {
     div()
@@ -86,7 +88,7 @@ pub(crate) fn clock_face(now_ms: u64) -> gpui_kit::Div {
         .font(clock_font())
         .text_size(px(22.0))
         .line_height(px(22.0))
-        .text_color(hsla(0.0, 0.0, 1.0, 0.72))
+        .text_color(theme::soft(0.72))
         .child(rustedge::clock::clock_label(now_ms))
 }
 
@@ -123,7 +125,7 @@ fn meter(
                 .flex()
                 .items_end()
                 .justify_between()
-                .child(div().text_size(px(11.0)).text_color(hsla(0.0, 0.0, 1.0, 0.6)).child(name))
+                .child(div().text_size(px(11.0)).text_color(theme::soft(0.66)).child(name))
                 .child(div().text_size(px(14.0)).child(value)),
         )
         .child(

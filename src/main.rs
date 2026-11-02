@@ -39,6 +39,7 @@ mod wallpaper;
 mod island_view;
 mod perf_view;
 mod pointer;
+mod theme;
 mod toasts;
 
 use anyhow::Context as _;

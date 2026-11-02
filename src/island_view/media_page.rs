@@ -24,6 +24,8 @@ use gpui_kit::{
 use rustedge::island::{self};
 use rustedge::media;
 
+use crate::theme;
+
 use super::{Click, millis_now};
 
 /// Card controls. Each closure updates `IslandView` directly.
@@ -82,7 +84,7 @@ pub(super) fn media_page(paint: MediaPaint<'_>) -> gpui_kit::Div {
                 .w(px(96.0))
                 .h(px(96.0))
                 .rounded(px(12.0))
-                .bg(rgb(0x003a_3a3c))
+                .bg(theme::track(0.18))
                 .into_any_element(),
         });
     div()
@@ -124,7 +126,7 @@ fn session_mark(open: bool, clicks: &CardClicks) -> gpui_kit::Div {
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .bg(hsla(0.0, 0.0, 1.0, if open { 0.28 } else { 0.12 }))
+        .bg(theme::surface(if open { 0.20 } else { 0.10 }))
         .on_mouse_down(MouseButton::Left, {
             let sessions = Rc::clone(&clicks.sessions);
             move |event, window, app| {
@@ -132,7 +134,7 @@ fn session_mark(open: bool, clicks: &CardClicks) -> gpui_kit::Div {
                 sessions(event, window, app);
             }
         })
-        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(rgb(0x00ff_ffff)))
+        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(rgb(theme::INK)))
 }
 
 fn session_list(sessions: &[media::MediaSession], clicks: &CardClicks) -> gpui_kit::Div {
@@ -143,7 +145,7 @@ fn session_list(sessions: &[media::MediaSession], clicks: &CardClicks) -> gpui_k
         .w(px(140.0))
         .flex()
         .flex_col()
-        .bg(hsla(0.0, 0.0, 0.1, 0.9))
+        .bg(hsla(0.58, 0.06, 0.96, 0.94))
         .rounded(px(8.0))
         .p(px(6.0));
     for (index, session) in sessions.iter().enumerate() {
@@ -157,7 +159,7 @@ fn session_list(sessions: &[media::MediaSession], clicks: &CardClicks) -> gpui_k
                     app.stop_propagation();
                     pick(&index, window, app);
                 })
-                .text_color(hsla(0.0, 0.0, 1.0, if session.current { 1.0 } else { 0.55 }))
+                .text_color(theme::soft(if session.current { 1.0 } else { 0.62 }))
                 .child(session.label.clone()),
         );
     }
@@ -198,7 +200,11 @@ fn mode_dot(on: bool) -> gpui_kit::Div {
         .w(px(16.0))
         .h(px(16.0))
         .rounded(px(8.0))
-        .bg(hsla(0.0, 0.0, 1.0, if on { 0.9 } else { 0.35 }))
+        .bg(if on {
+            theme::fill(0.85)
+        } else {
+            theme::track(0.30)
+        })
 }
 
 struct SeekPaint<'a> {
@@ -243,7 +249,7 @@ fn seek_column(paint: SeekPaint<'_>) -> gpui_kit::Div {
             column.child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(hsla(0.0, 0.0, 1.0, 0.55))
+                    .text_color(theme::soft(0.65))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -287,13 +293,13 @@ fn progress_track(progress: f32, hot: bool) -> gpui_kit::Div {
         .w(px(width))
         .h(px(if hot { 6.0 } else { 4.0 }))
         .rounded(px(2.0))
-        .bg(hsla(0.0, 0.0, 1.0, 0.15))
+        .bg(theme::track(0.16))
         .child(
             div()
                 .w(px(fill))
                 .h_full()
                 .rounded(px(2.0))
-                .bg(rgb(0x00ff_ffff)),
+                .bg(theme::fill(0.90)),
         )
         .when(hot, |track| {
             track.child(
@@ -304,7 +310,7 @@ fn progress_track(progress: f32, hot: bool) -> gpui_kit::Div {
                     .w(px(island::SEEK_THUMB))
                     .h(px(island::SEEK_THUMB))
                     .rounded(px(island::SEEK_THUMB / 2.0))
-                    .bg(rgb(0x00ff_ffff)),
+                    .bg(theme::fill(0.90)),
             )
         })
 }
@@ -358,9 +364,9 @@ where
         .justify_center()
         .opacity(if enabled { 1.0 } else { island::REFUSED_OPACITY })
         .when(enabled, gpui_kit::Styled::cursor_pointer)
-        .when(primary, |button| button.bg(hsla(0.0, 0.0, 1.0, 0.12)))
+        .when(primary, |button| button.bg(theme::surface(0.10)))
         .when(enabled, move |button| {
-            button.hover(move |button| button.bg(hsla(0.0, 0.0, 1.0, if primary { 0.18 } else { 0.10 })))
+            button.hover(move |button| button.bg(theme::surface(if primary { 0.16 } else { 0.08 })))
         })
         .on_mouse_down(MouseButton::Left, listener)
         .child(mark)
@@ -391,7 +397,7 @@ fn triangle(forward: bool) -> impl IntoElement {
             let mut path = gpui_kit::Path::new(tip);
             path.line_to(base_top);
             path.line_to(base_bottom);
-            window.paint_path(path, rgb(0x00ff_ffff));
+            window.paint_path(path, rgb(theme::INK));
         },
     )
     .w(px(10.0))
@@ -407,11 +413,11 @@ fn play_mark(playing: bool) -> gpui_kit::Div {
 }
 
 fn wedge() -> gpui_kit::Div {
-    div().w(px(10.0)).h(px(12.0)).rounded(px(2.0)).bg(rgb(0x00ff_ffff))
+    div().w(px(10.0)).h(px(12.0)).rounded(px(2.0)).bg(rgb(theme::INK))
 }
 
 fn stem() -> gpui_kit::Div {
-    div().w(px(3.0)).h(px(12.0)).rounded(px(1.0)).bg(rgb(0x00ff_ffff))
+    div().w(px(3.0)).h(px(12.0)).rounded(px(1.0)).bg(rgb(theme::INK))
 }
 
 #[allow(dead_code)]
@@ -423,7 +429,7 @@ where
         .px(px(12.0))
         .py(px(8.0))
         .rounded(px(16.0))
-        .bg(hsla(0.0, 0.0, 1.0, 0.12))
+        .bg(theme::surface(0.10))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, listener)
         .child(label)
@@ -444,7 +450,7 @@ pub(super) fn bars(playing: bool) -> gpui_kit::Div {
 }
 
 fn bar(index: u64, period_ms: u64, playing: bool) -> gpui_kit::AnyElement {
-    let color = rgb(0x00f5_f5f7);
+    let color = rgb(theme::INK);
     let height = if playing { bar_height(index, period_ms, millis_now()) } else { 8.0 };
     div()
         .w(px(3.0))

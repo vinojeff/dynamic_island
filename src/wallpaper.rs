@@ -8,8 +8,9 @@
 //! mtime) or the stage rect (the dock slides across monitors with different
 //! origins and DPI scales).
 //!
-//! Scope notes: the display is mapped as a plain stretch, so a wallpaper
-//! whose aspect ratio differs from the display is cropped approximately.
+//! Scope notes: `WallpaperStyle` and `TileWallpaper` from the desktop registry
+//! select the Windows placement (fill, fit, center, stretch, tile). `Span`
+//! across multiple monitors is approximated as fill on the primary display.
 //! Per-monitor wallpapers are not honored; [`SystemParametersInfoW`] reports
 //! the shared path and the dock lives on the primary display. Live video
 //! wallpapers (Wallpaper Engine) never change a file, so the glass keeps the
@@ -20,6 +21,8 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use gpui_kit::RenderImage;
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETDESKWALLPAPER, SystemParametersInfoW,
 };
@@ -31,6 +34,46 @@ pub const BLUR_RADIUS: usize = 12;
 
 /// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
 pub const SATURATION: f32 = 1.15;
+
+/// How Windows places the wallpaper on the primary display.
+///
+/// Mirrors `HKCU\Control Panel\Desktop\WallpaperStyle` plus `TileWallpaper`.
+/// `Span` is accepted but approximated as [`Self::Fill`] on the primary
+/// display; a true virtual-desktop span needs per-monitor geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WallpaperPosition {
+    /// Native size, centered; anything outside the display is cropped.
+    Center,
+    /// Native size, repeated across the display.
+    Tile,
+    /// Non-uniform stretch to the display size.
+    Stretch,
+    /// Uniform scale to fit, with transparent letterbox margins.
+    Fit,
+    /// Uniform scale to cover, centered and cropped.
+    Fill,
+    /// Virtual-desktop span, approximated as [`Self::Fill`] on the primary.
+    Span,
+}
+
+impl WallpaperPosition {
+    /// Parses the two registry strings. Tile wins over the style value.
+    ///
+    /// Missing or unknown styles use `Fill`, the modern Windows default.
+    #[must_use]
+    pub fn from_registry(style: &str, tile: &str) -> Self {
+        if tile.trim() == "1" {
+            return Self::Tile;
+        }
+        match style.trim() {
+            "0" => Self::Center,
+            "2" => Self::Stretch,
+            "6" => Self::Fit,
+            "22" => Self::Span,
+            _ => Self::Fill,
+        }
+    }
+}
 
 /// A frosted wallpaper crop ready to paint. Built on the background executor
 /// and swapped into the view as one value.
@@ -56,6 +99,8 @@ pub struct Fingerprint {
     mtime: u64,
     /// The stage rect the crop was taken for.
     rect: (i32, i32, u32, u32),
+    /// The Windows placement the crop was drawn with.
+    position: WallpaperPosition,
 }
 
 /// Snapshots one fingerprint: wallpaper path + stats for the given stage rect.
@@ -64,12 +109,17 @@ pub struct Fingerprint {
 /// vanished between the path call and the stat.
 #[must_use]
 pub fn fingerprint_now(rect: (i32, i32, u32, u32)) -> Option<Fingerprint> {
-    fingerprint_file(wallpaper_path()?.as_str(), rect)
+    let path = wallpaper_path()?;
+    fingerprint_file(&path, rect, desktop_position())
 }
 
 /// Stats a specific path. Split from [`fingerprint_now`] so tests can pin a
 /// temp file instead of whatever wallpaper the desktop currently shows.
-fn fingerprint_file(path: &str, rect: (i32, i32, u32, u32)) -> Option<Fingerprint> {
+fn fingerprint_file(
+    path: &str,
+    rect: (i32, i32, u32, u32),
+    position: WallpaperPosition,
+) -> Option<Fingerprint> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -81,6 +131,7 @@ fn fingerprint_file(path: &str, rect: (i32, i32, u32, u32)) -> Option<Fingerprin
         len: meta.len(),
         mtime,
         rect,
+        position,
     })
 }
 
@@ -108,6 +159,55 @@ fn wallpaper_path() -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(buffer.get(..end)?))
+}
+
+/// Reads the active wallpaper placement from the desktop registry.
+fn desktop_position() -> WallpaperPosition {
+    let style = desktop_value("WallpaperStyle").unwrap_or_default();
+    let tile = desktop_value("TileWallpaper").unwrap_or_default();
+    WallpaperPosition::from_registry(&style, &tile)
+}
+
+/// Reads one string value under `HKCU\Control Panel\Desktop`.
+fn desktop_value(name: &str) -> Option<String> {
+    let subkey = wide("Control Panel\\Desktop");
+    let value = wide(name);
+    let mut buffer = [0u16; 64];
+    let mut bytes = u32::try_from(buffer.len().checked_mul(2)?).ok()?;
+    // SAFETY: both names are null-terminated, `buffer` lives for the call,
+    // and `bytes` describes its byte capacity.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &raw mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let len = usize::try_from(bytes)
+        .ok()?
+        .checked_div(2)?
+        .min(buffer.len());
+    let end = buffer
+        .iter()
+        .take(len)
+        .position(|&unit| unit == 0)
+        .unwrap_or(len);
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(buffer.get(..end)?))
+}
+
+/// Null-terminates a string for the wide Win32 APIs.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Physical display size the wallpaper currently covers. Primary monitor.
@@ -146,19 +246,11 @@ pub fn build(display: (u32, u32), rect: (i32, i32, u32, u32)) -> Option<GlassBac
         .decode()
         .ok()?
         .to_rgba8();
-    // Fill-mapping approximation: the wallpaper is stretched over the whole
-    // display, then the stage is cropped out of that.
-    let stretched = image::imageops::resize(
-        &wall,
-        display.0,
-        display.1,
-        image::imageops::FilterType::Triangle,
-    );
-    let (x, y, w, h) = map_rect((stretched.width(), stretched.height()), display, rect);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let mut crop_raw = image::imageops::crop_imm(&stretched, x, y, w, h)
+    // Draw the wallpaper the way Windows does, then crop the stage out of
+    // that display-sized canvas. The crop is one-to-one with the desktop.
+    let composed = compose(&wall, display, fingerprint.position);
+    let (x, y, w, h) = stage_crop((composed.width(), composed.height()), rect)?;
+    let mut crop_raw = image::imageops::crop_imm(&composed, x, y, w, h)
         .to_image()
         .into_raw();
     let cw = w as usize;
@@ -173,34 +265,106 @@ pub fn build(display: (u32, u32), rect: (i32, i32, u32, u32)) -> Option<GlassBac
     })
 }
 
-/// Maps the stage rect into wallpaper pixels under stretch mapping.
+/// Draws the wallpaper into a display-sized canvas using the Windows placement.
 ///
-/// Returns the crop `(x, y, width, height)`, clamped to the wallpaper so a
-/// half-off-screen window still crops a valid region.
+/// `Fill`, `Span`, and `Stretch` cover every pixel; `Fit` and `Center` leave
+/// transparent margins so the real desktop background shows through; `Tile`
+/// repeats the native image. `imageops::replace` clips negative placements,
+/// so a covered image crops instead of failing.
 #[must_use]
-pub fn map_rect(
-    wall: (u32, u32),
+fn compose(
+    wall: &image::RgbaImage,
+    display: (u32, u32),
+    position: WallpaperPosition,
+) -> image::RgbaImage {
+    let mut canvas =
+        image::RgbaImage::from_pixel(display.0, display.1, image::Rgba([0, 0, 0, 0]));
+    let (wall_w, wall_h) = wall.dimensions();
+    if wall_w == 0 || wall_h == 0 || display.0 == 0 || display.1 == 0 {
+        return canvas;
+    }
+    match position {
+        WallpaperPosition::Stretch => {
+            let resized = resize_wall(wall, display.0, display.1);
+            image::imageops::replace(&mut canvas, &resized, 0, 0);
+        }
+        WallpaperPosition::Fill | WallpaperPosition::Span => {
+            let scale = (f64::from(display.0) / f64::from(wall_w))
+                .max(f64::from(display.1) / f64::from(wall_h));
+            let (width, height) = scaled_dimensions(wall_w, wall_h, scale);
+            let resized = resize_wall(wall, width, height);
+            let x = (i64::from(display.0) - i64::from(width)) / 2;
+            let y = (i64::from(display.1) - i64::from(height)) / 2;
+            image::imageops::replace(&mut canvas, &resized, x, y);
+        }
+        WallpaperPosition::Fit => {
+            let scale = (f64::from(display.0) / f64::from(wall_w))
+                .min(f64::from(display.1) / f64::from(wall_h));
+            let (width, height) = scaled_dimensions(wall_w, wall_h, scale);
+            let resized = resize_wall(wall, width, height);
+            let x = (i64::from(display.0) - i64::from(width)) / 2;
+            let y = (i64::from(display.1) - i64::from(height)) / 2;
+            image::imageops::replace(&mut canvas, &resized, x, y);
+        }
+        WallpaperPosition::Center => {
+            let x = (i64::from(display.0) - i64::from(wall_w)) / 2;
+            let y = (i64::from(display.1) - i64::from(wall_h)) / 2;
+            image::imageops::replace(&mut canvas, wall, x, y);
+        }
+        WallpaperPosition::Tile => {
+            let mut y = 0i64;
+            while y < i64::from(display.1) {
+                let mut x = 0i64;
+                while x < i64::from(display.0) {
+                    image::imageops::replace(&mut canvas, wall, x, y);
+                    x += i64::from(wall_w);
+                }
+                y += i64::from(wall_h);
+            }
+        }
+    }
+    canvas
+}
+
+/// Scales a wallpaper without changing its aspect ratio. The result is at
+/// least one pixel on each axis.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "positive dimensions scaled by a finite positive factor round to \
+              a small u32; the sanitiser keeps the result above zero"
+)]
+fn scaled_dimensions(width: u32, height: u32, scale: f64) -> (u32, u32) {
+    let scaled_w = (f64::from(width) * scale).round().max(1.0) as u32;
+    let scaled_h = (f64::from(height) * scale).round().max(1.0) as u32;
+    (scaled_w, scaled_h)
+}
+
+/// One triangle-filter resize, the same filter the old stretch path used.
+fn resize_wall(wall: &image::RgbaImage, width: u32, height: u32) -> image::RgbaImage {
+    image::imageops::resize(wall, width, height, image::imageops::FilterType::Triangle)
+}
+
+/// Clips the stage rect to the display, in display pixels.
+///
+/// Returns `None` when the stage is entirely off-screen or the display has no
+/// usable size.
+#[must_use]
+pub fn stage_crop(
     display: (u32, u32),
     rect: (i32, i32, u32, u32),
-) -> (u32, u32, u32, u32) {
-    if wall.0 == 0 || wall.1 == 0 || display.0 == 0 || display.1 == 0 {
-        return (0, 0, 0, 0);
+) -> Option<(u32, u32, u32, u32)> {
+    if display.0 == 0 || display.1 == 0 {
+        return None;
     }
-    let scale_x = f64::from(wall.0) / f64::from(display.0);
-    let scale_y = f64::from(wall.1) / f64::from(display.1);
-    // floor after scaling, clamped to the wallpaper; a rect wider than the
-    // wall simply shrinks rather than wrapping.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let x = (f64::from(rect.0) * scale_x).max(0.0) as u32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let y = (f64::from(rect.1) * scale_y).max(0.0) as u32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let w = (f64::from(rect.2) * scale_x) as u32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let h = (f64::from(rect.3) * scale_y) as u32;
-    let w = w.min(wall.0.saturating_sub(x));
-    let h = h.min(wall.1.saturating_sub(y));
-    (x, y, w, h)
+    let x = u32::try_from(rect.0.max(0)).ok()?;
+    let y = u32::try_from(rect.1.max(0)).ok()?;
+    let width = rect.2.min(display.0.saturating_sub(x));
+    let height = rect.3.min(display.1.saturating_sub(y));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((x, y, width, height))
 }
 
 /// One box-blur pass over one axis. RGBA, alpha passed through.
@@ -372,23 +536,107 @@ mod tests {
         bytes.into_inner()
     }
 
-    #[test]
-    fn map_rect_scales_the_window_rect_into_wallpaper_pixels() {
-        // A 3200x1800 wallpaper stretched over a 2560x1440 display: the
-        // scale is 1.25 on both axes.
-        let crop = map_rect((3200, 1800), (2560, 1440), (1070, 0, 420, 360));
-        assert_eq!(crop, (1337, 0, 525, 450));
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> image::RgbaImage {
+        image::RgbaImage::from_pixel(width, height, image::Rgba(rgba))
     }
 
     #[test]
-    fn map_rect_clamps_a_rect_hanging_off_the_display() {
-        let crop = map_rect((1000, 1000), (1000, 1000), (900, 0, 400, 100));
-        assert_eq!(crop, (900, 0, 100, 100));
+    fn registry_values_map_to_the_windows_placement() {
+        use WallpaperPosition::{Center, Fill, Fit, Span, Stretch, Tile};
+        assert_eq!(WallpaperPosition::from_registry("0", "0"), Center);
+        assert_eq!(WallpaperPosition::from_registry("2", "0"), Stretch);
+        assert_eq!(WallpaperPosition::from_registry("6", "0"), Fit);
+        assert_eq!(WallpaperPosition::from_registry("10", "0"), Fill);
+        assert_eq!(WallpaperPosition::from_registry("22", "0"), Span);
+        assert_eq!(
+            WallpaperPosition::from_registry("10", "1"),
+            Tile,
+            "tile wins over any style"
+        );
+        assert_eq!(
+            WallpaperPosition::from_registry("", ""),
+            Fill,
+            "missing values use the modern default"
+        );
+        assert_eq!(WallpaperPosition::from_registry("99", "0"), Fill);
     }
 
     #[test]
-    fn map_rect_is_zero_on_degenerate_sizes() {
-        assert_eq!(map_rect((0, 10), (10, 10), (0, 0, 1, 1)), (0, 0, 0, 0));
+    fn fill_covers_the_display_and_keeps_the_center() {
+        // 4x2, left half red and right half blue, covered onto 2x2: scale 1,
+        // placed at x = -1, so the canvas shows source columns 1 and 2.
+        let wall = image::RgbaImage::from_fn(4, 2, |x, _| {
+            if x < 2 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let canvas = compose(&wall, (2, 2), WallpaperPosition::Fill);
+        assert_eq!(canvas.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(canvas.get_pixel(1, 0).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn fit_letterboxes_instead_of_cropping() {
+        let wall = solid(4, 2, [10, 20, 30, 255]);
+        let canvas = compose(&wall, (4, 4), WallpaperPosition::Fit);
+        assert_eq!(
+            canvas.get_pixel(0, 0).0[3],
+            0,
+            "top letterbox is transparent"
+        );
+        assert_eq!(canvas.get_pixel(0, 1).0, [10, 20, 30, 255]);
+        assert_eq!(canvas.get_pixel(3, 2).0, [10, 20, 30, 255]);
+        assert_eq!(
+            canvas.get_pixel(0, 3).0[3],
+            0,
+            "bottom letterbox is transparent"
+        );
+    }
+
+    #[test]
+    fn stretch_fills_every_pixel_without_preserving_aspect() {
+        let wall = solid(4, 2, [1, 2, 3, 255]);
+        let canvas = compose(&wall, (4, 4), WallpaperPosition::Stretch);
+        assert_eq!(canvas.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        assert_eq!(canvas.get_pixel(3, 3).0, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn center_keeps_native_size_and_leaves_margins() {
+        let wall = solid(2, 2, [200, 10, 10, 255]);
+        let canvas = compose(&wall, (4, 4), WallpaperPosition::Center);
+        assert_eq!(canvas.get_pixel(0, 0).0[3], 0);
+        assert_eq!(canvas.get_pixel(1, 1).0, [200, 10, 10, 255]);
+        assert_eq!(canvas.get_pixel(2, 2).0, [200, 10, 10, 255]);
+        assert_eq!(canvas.get_pixel(3, 3).0[3], 0);
+    }
+
+    #[test]
+    fn tile_repeats_the_native_wallpaper() {
+        let wall = image::RgbaImage::from_fn(2, 2, |x, _| {
+            if x == 0 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let canvas = compose(&wall, (4, 4), WallpaperPosition::Tile);
+        assert_eq!(canvas.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(canvas.get_pixel(1, 0).0, [0, 0, 255, 255]);
+        assert_eq!(canvas.get_pixel(2, 0).0, [255, 0, 0, 255]);
+        assert_eq!(canvas.get_pixel(3, 0).0, [0, 0, 255, 255]);
+        assert_eq!(canvas.get_pixel(0, 2).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn stage_crop_clamps_a_rect_hanging_off_the_display() {
+        assert_eq!(
+            stage_crop((1000, 1000), (900, 0, 400, 100)),
+            Some((900, 0, 100, 100))
+        );
+        assert_eq!(stage_crop((0, 10), (0, 0, 1, 1)), None);
     }
 
     #[test]
@@ -449,9 +697,9 @@ mod tests {
         std::fs::write(&file, tiny_png([[1, 2, 3, 255]; 4])).unwrap();
         let path = file.to_string_lossy().into_owned();
         let rect = (1070, 0, 420, 360);
-        let first = fingerprint_file(&path, rect);
+        let first = fingerprint_file(&path, rect, WallpaperPosition::Fill);
         assert!(first.is_some(), "the file exists so a fingerprint exists");
-        let same = fingerprint_file(&path, rect);
+        let same = fingerprint_file(&path, rect, WallpaperPosition::Fill);
         assert_eq!(first, same, "nothing changed");
 
         // Force the mtime so a rewrite is observable at second resolution.
@@ -464,13 +712,20 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();
         drop(handle);
-        let retime = fingerprint_file(&path, rect);
+        let retime = fingerprint_file(&path, rect, WallpaperPosition::Fill);
         assert_ne!(first, retime, "a new mtime is a new fingerprint");
 
-        let moved = fingerprint_file(&path, (900, 0, 420, 360));
+        let moved = fingerprint_file(&path, (900, 0, 420, 360), WallpaperPosition::Fill);
         assert_ne!(first, moved, "a moved stage rect is a new fingerprint");
 
-        let vanished = fingerprint_file(&dir.join("missing.png").to_string_lossy(), rect);
+        let restyled = fingerprint_file(&path, rect, WallpaperPosition::Fit);
+        assert_ne!(first, restyled, "a new placement is a new fingerprint");
+
+        let vanished = fingerprint_file(
+            &dir.join("missing.png").to_string_lossy(),
+            rect,
+            WallpaperPosition::Fill,
+        );
         assert!(vanished.is_none(), "a vanished file has no fingerprint");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -488,9 +743,9 @@ mod tests {
         std::fs::write(&file, b"not an image at all").unwrap();
         let path = file.to_string_lossy().into_owned();
         let rect = (1070, 0, 420, 360);
-        let first = fingerprint_file(&path, rect);
+        let first = fingerprint_file(&path, rect, WallpaperPosition::Fill);
         assert!(first.is_some());
-        let again = fingerprint_file(&path, rect);
+        let again = fingerprint_file(&path, rect, WallpaperPosition::Fill);
         assert_eq!(first, again, "fingerprint stability across failures");
         std::fs::remove_dir_all(&dir).ok();
     }

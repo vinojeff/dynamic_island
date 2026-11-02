@@ -36,6 +36,7 @@ use rustedge::perf::{self, PerfHistory};
 use rustedge::volume::{self, VolumeState};
 
 use crate::perf_view;
+use crate::theme;
 
 use super::media_page::{CardClicks, MediaPaint, bars, controls, media_page};
 use super::{Click, Face, millis_now};
@@ -80,7 +81,7 @@ where
     let page_prev = Rc::new(page_prev);
     let page_next = Rc::new(page_next);
     let playing = if tab == Tab::Media { media_playing } else { playing };
-    let ink = rgb(0x00f5_f5f7);
+    let ink = rgb(theme::INK);
     // The tucked line paints its own tapered glass lens instead of the shell.
     if shape.height < 12.0 {
         return line_glass(shape.width);
@@ -329,7 +330,7 @@ fn marquee(title: &str, window: &Window) -> gpui_kit::AnyElement {
 }
 
 fn solid_line(title: &str) -> gpui_kit::Div {
-    div().text_size(px(TEXT_PX)).text_color(rgb(0x00f5_f5f7)).child(title.to_owned())
+    div().text_size(px(TEXT_PX)).text_color(rgb(theme::INK)).child(title.to_owned())
 }
 
 /// One shaping of the whole line. Glyph positions come from the font, so
@@ -360,7 +361,7 @@ fn shape_line(title: &str, window: &Window) -> ShapedLine {
         &[TextRun {
             len: title.len(),
             font,
-            color: hsla(0.0, 0.0, 0.96, 1.0),
+            color: theme::fill(1.0),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -436,7 +437,7 @@ fn paint_glyphs(bounds: Bounds<Pixels>, glyphs: &[PaintedGlyph], window: &mut Wi
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for glyph in glyphs {
             let origin = Point { x: px(f32::from(bounds.origin.x) + glyph.x), y: px(baseline) };
-            let color = hsla(0.0, 0.0, 0.96, glyph.alpha);
+            let color = theme::fill(glyph.alpha);
             let _painted = window.paint_glyph(origin, glyph.font, glyph.glyph, px(TEXT_PX), color);
         }
     });
@@ -579,9 +580,9 @@ where
     M: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 {
     let fill = if volume.muted {
-        hsla(0.0, 0.0, 1.0, 0.4)
+        theme::track(0.45)
     } else {
-        rgb(0x00ff_ffff).into()
+        theme::fill(0.90)
     };
     div()
         .absolute()
@@ -617,7 +618,7 @@ fn thin_meter(level: f32, fill: gpui_kit::Hsla) -> gpui_kit::Div {
         .w_full()
         .h(px(3.0))
         .rounded(px(2.0))
-        .bg(hsla(0.0, 0.0, 1.0, 0.15))
+        .bg(theme::track(0.16))
         .child(
             div()
                 .w(gpui_kit::relative(level))
@@ -639,12 +640,12 @@ fn speaker(icon: volume::VolumeIcon) -> gpui_kit::Div {
         .flex()
         .items_center()
         .gap(px(2.0))
-        .child(div().w(px(4.0)).h(px(8.0)).rounded(px(1.0)).bg(rgb(0x00f5_f5f7)))
-        .child(div().w(px(3.0)).h(px(12.0)).rounded(px(1.0)).bg(rgb(0x00f5_f5f7)))
-        .when(waves >= 1, |row| row.child(div().w(px(2.0)).h(px(8.0)).rounded(px(1.0)).bg(hsla(0.0, 0.0, 1.0, 0.7))))
-        .when(waves >= 2, |row| row.child(div().w(px(2.0)).h(px(12.0)).rounded(px(1.0)).bg(hsla(0.0, 0.0, 1.0, 0.7))))
+        .child(div().w(px(4.0)).h(px(8.0)).rounded(px(1.0)).bg(rgb(theme::INK)))
+        .child(div().w(px(3.0)).h(px(12.0)).rounded(px(1.0)).bg(rgb(theme::INK)))
+        .when(waves >= 1, |row| row.child(div().w(px(2.0)).h(px(8.0)).rounded(px(1.0)).bg(theme::fill(0.70))))
+        .when(waves >= 2, |row| row.child(div().w(px(2.0)).h(px(12.0)).rounded(px(1.0)).bg(theme::fill(0.70))))
         .when(icon == volume::VolumeIcon::Muted, |row| {
-            row.child(div().w(px(2.0)).h(px(12.0)).bg(rgb(0x00ff_5a5a)))
+            row.child(div().w(px(2.0)).h(px(12.0)).bg(rgb(0x00c0_3a2b)))
         })
 }
 

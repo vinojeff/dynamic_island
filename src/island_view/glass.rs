@@ -48,11 +48,11 @@ pub(super) const IDLE_LUMA: f32 = 0.35;
 /// How many concentric bands the rim renders, bright rim inward.
 const RIM_BANDS: usize = 3;
 
-/// The scrim a luma calls for. Bright wallpaper deepens it so the ink stays
-/// readable; dark wallpaper thins it so the frost shows.
+/// The milky veil a luma calls for. A dark wallpaper needs more milk so the
+/// dark ink stays readable; a bright wallpaper needs less so its color shows.
 #[must_use]
-pub(super) fn scrim_alpha(luma: f32) -> f32 {
-    (0.14 + 0.30 * luma).clamp(0.10, 0.44)
+pub(super) fn veil_alpha(luma: f32) -> f32 {
+    (0.56 - 0.22 * luma).clamp(0.34, 0.56)
 }
 
 /// Horizontal amount the shell sits right of the window's left edge.
@@ -72,9 +72,9 @@ pub(super) fn shell_offset(shape_width: f32) -> f32 {
 #[must_use]
 pub(super) fn rim_alpha(band: usize) -> f32 {
     match band {
-        0 => 0.28,
-        1 => 0.10,
-        2 => 0.04,
+        0 => 0.50,
+        1 => 0.18,
+        2 => 0.07,
         _ => 0.0,
     }
 }
@@ -87,15 +87,15 @@ pub(super) fn rim_alpha(band: usize) -> f32 {
 pub(super) fn shell_shadows() -> Vec<BoxShadow> {
     vec![
         BoxShadow {
-            color: hsla(0.0, 0.0, 0.0, 0.40),
-            offset: point(px(0.0), px(16.0)),
-            blur_radius: px(48.0),
+            color: hsla(0.0, 0.0, 0.0, 0.30),
+            offset: point(px(0.0), px(14.0)),
+            blur_radius: px(44.0),
             spread_radius: px(0.0),
             inset: false,
         },
         BoxShadow {
             // The hem. Real glass is weightier along the bottom rim.
-            color: hsla(0.0, 0.0, 0.0, 0.25),
+            color: hsla(0.55, 0.08, 0.18, 0.16),
             offset: point(px(0.0), px(2.0)),
             blur_radius: px(6.0),
             spread_radius: px(0.0),
@@ -103,7 +103,7 @@ pub(super) fn shell_shadows() -> Vec<BoxShadow> {
         },
         BoxShadow {
             // The glow. Same hue family as the tucked line's bloom.
-            color: hsla(GLASS_HUE, 0.60, 0.70, 0.12),
+            color: hsla(GLASS_HUE, 0.60, 0.70, 0.10),
             offset: point(px(0.0), px(0.0)),
             blur_radius: px(24.0),
             spread_radius: px(0.0),
@@ -125,7 +125,9 @@ pub(super) fn frost(
     backdrop: Option<&Arc<RenderImage>>,
 ) -> gpui_kit::Div {
     let base = div().absolute().inset_0();
-    if state == IslandState::Line {
+    // `chrome::paint` hands the tucked line to `line_glass` below 12px, so the
+    // frost must not paint a blurred sliver under it during the tuck morph.
+    if state == IslandState::Line || shape.height < 12.0 {
         return base;
     }
     let Some(image) = backdrop else {
@@ -135,24 +137,30 @@ pub(super) fn frost(
     let width = shape.width;
     let height = shape.height;
     let radius = px(shape.radius);
-    base.child(canvas(
-        |_, _, _| (),
-        move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-            let shell = Bounds::new(
-                point(bounds.origin.x + px(shell_offset(width)), bounds.origin.y),
-                size(px(width), px(height)),
-            );
-            // Slide the wallpaper crop into window space, clipped to the shell.
-            let _painted = window.paint_image(
-                shell,
-                bounds,
-                Corners::all(radius),
-                Arc::clone(&image),
-                0,
-                false,
-            );
-        },
-    ))
+    // `canvas()` defaults to an auto-sized box: in this block parent its
+    // height collapses to zero and `paint_image` bails on an empty rect.
+    // `size_full` is load-bearing, not decoration.
+    base.child(
+        canvas(
+            |_, _, _| (),
+            move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
+                let shell = Bounds::new(
+                    point(bounds.origin.x + px(shell_offset(width)), bounds.origin.y),
+                    size(px(width), px(height)),
+                );
+                // Slide the wallpaper crop into window space, clipped to the shell.
+                let _painted = window.paint_image(
+                    shell,
+                    bounds,
+                    Corners::all(radius),
+                    Arc::clone(&image),
+                    0,
+                    false,
+                );
+            },
+        )
+        .size_full(),
+    )
 }
 
 /// The shell's underlay layers: scrim, specular sheen, rim, dispersion.
@@ -163,23 +171,25 @@ pub(super) fn frost(
 /// come from every layer's own rounded background — same as [`frost`] clips
 /// through `paint_image`'s radii.
 ///
-/// With no backdrop yet, the scrim is the fallback wash — a thin two-stop
-/// gradient standing in until the frosted crop arrives.
+/// With no backdrop yet, the scrim is the fallback wash — a light two-stop
+/// glass gradient standing in until the frosted crop arrives.
 pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Vec<gpui_kit::Div> {
     let luma = glass.map_or(IDLE_LUMA, |(_, luma)| luma);
     let seeded = glass.is_some();
     let shape = div().absolute().inset_0().rounded(px(radius));
     let scrim = if seeded {
+        let top = veil_alpha(luma);
+        let bottom = (top + 0.06).min(0.62);
         shape.bg(linear_gradient(
             180.0,
-            linear_color_stop(hsla(0.0, 0.0, 0.05, scrim_alpha(luma)), 0.0),
-            linear_color_stop(hsla(0.0, 0.0, 0.04, scrim_alpha(luma)), 1.0),
+            linear_color_stop(hsla(GLASS_HUE, 0.22, 0.98, top), 0.0),
+            linear_color_stop(hsla(GLASS_HUE, 0.14, 0.91, bottom), 1.0),
         ))
     } else {
         shape.bg(linear_gradient(
             180.0,
-            linear_color_stop(hsla(0.0, 0.0, 0.05, 0.62), 0.0),
-            linear_color_stop(hsla(0.0, 0.0, 0.04, 0.48), 1.0),
+            linear_color_stop(hsla(GLASS_HUE, 0.20, 0.97, 0.78), 0.0),
+            linear_color_stop(hsla(GLASS_HUE, 0.12, 0.90, 0.86), 1.0),
         ))
     };
     // The sheen. GPUI gradients take exactly two stops, so the three-stop
@@ -190,7 +200,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .rounded(px(radius))
         .bg(linear_gradient(
             SPECULAR_ANGLE,
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.10), 0.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.28), 0.0),
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
         ));
     let sheen_low = div()
@@ -200,14 +210,19 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .bg(linear_gradient(
             SPECULAR_ANGLE,
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.03), 1.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.10), 1.0),
         ));
-    let rim = div().absolute().inset_0().child(canvas(
-        |_, _, _| (),
-        move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-            paint_rim(bounds, radius, window);
-        },
-    ));
+    // Same auto-size trap as the frost: without `size_full` the canvas is
+    // zero-high and every `paint_ring` band fails its size guard.
+    let rim = div().absolute().inset_0().child(
+        canvas(
+            |_, _, _| (),
+            move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
+                paint_rim(bounds, radius, window);
+            },
+        )
+        .size_full(),
+    );
     vec![scrim, sheen_high, sheen_low, rim]
 }
 
@@ -347,20 +362,34 @@ fn walk_rounded(
     points
 }
 
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::{IntoElement, ParentElement, Styled, div, point, px, size};
+
+    use rustedge::island::{
+        CARD_HEIGHT, CARD_RADIUS, CARD_WIDTH, PILL_WIDTH, STAGE_HEIGHT, STAGE_WIDTH,
+    };
+
     use super::*;
-    use rustedge::island::{CARD_WIDTH, PILL_WIDTH};
+
+    fn backdrop() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::new(2, 2)
+        )]))
+    }
 
     #[test]
-    fn scrim_deepens_on_a_bright_wallpaper_and_thins_on_a_dark_one() {
-        assert_eq!(scrim_alpha(0.0), 0.14, "dark wallpaper → thin scrim");
-        assert_eq!(scrim_alpha(1.0), 0.44, "bright wallpaper → deep scrim");
+    fn veil_thickens_on_a_dark_wallpaper_and_thins_on_a_bright_one() {
+        assert_eq!(veil_alpha(0.0), 0.56, "dark wallpaper → more milk");
+        assert_eq!(veil_alpha(1.0), 0.34, "bright wallpaper → less milk");
         let mut luma = 0.0;
         while luma <= 1.0 {
             assert!(
-                (0.10..=0.44).contains(&scrim_alpha(luma)),
+                (0.34..=0.56).contains(&veil_alpha(luma)),
                 "luma {luma} escapes the clamp"
             );
             luma += 0.05;
@@ -384,12 +413,77 @@ mod tests {
 
     #[test]
     fn rim_alpha_falls_off_inward_and_exactly_bright_at_edge() {
-        assert_eq!(rim_alpha(0), 0.28, "the edge is the Fresnel peak");
+        assert_eq!(rim_alpha(0), 0.50, "the edge is the Fresnel peak");
         assert!(rim_alpha(0) > rim_alpha(1) && rim_alpha(1) > rim_alpha(2));
         assert_eq!(rim_alpha(RIM_BANDS), 0.0, "beyond the rim: nothing");
         // `(STAGE_WIDTH − width)/2` centers any morph width.
         let expected = (island::STAGE_WIDTH as f32 - 260.0) / 2.0;
         near(shell_offset(260.0), expected);
+    }
+
+    /// The frost is painted from a canvas. A bare `canvas()` has an auto
+    /// height in a block parent and collapses to zero, which makes
+    /// `paint_image` bail on its empty visible rect: the frost silently never
+    /// appears. Its bounds must be the whole stage.
+    #[gpui_kit::test]
+    fn the_frost_canvas_fills_the_stage(cx: &mut gpui_kit::TestAppContext) {
+        let measured = Rc::new(Cell::new((0.0f32, 0.0f32)));
+        let image = backdrop();
+        let slot = Rc::clone(&measured);
+        let frost = super::frost(
+            island::resting(IslandState::Card),
+            IslandState::Card,
+            Some(&image),
+        )
+        .on_children_prepainted(move |children, _, _| {
+            if let Some(bounds) = children.last() {
+                slot.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+            }
+        });
+        cx.add_empty_window().draw(
+            point(px(0.0), px(0.0)),
+            size(px(STAGE_WIDTH as f32), px(STAGE_HEIGHT as f32)),
+            move |_window, _app| div().size_full().relative().child(frost).into_any_element(),
+        );
+        let (width, height) = measured.get();
+        assert!(
+            (width - STAGE_WIDTH as f32).abs() < 0.01,
+            "frost canvas width {width} does not fill the {STAGE_WIDTH}px stage"
+        );
+        assert!(
+            (height - STAGE_HEIGHT as f32).abs() < 0.01,
+            "frost canvas height {height} does not fill the {STAGE_HEIGHT}px stage"
+        );
+    }
+
+    /// Same trap for the rim canvas: zero height means every band fails
+    /// `paint_ring`'s positive-size guard and the rim never paints either.
+    #[gpui_kit::test]
+    fn the_rim_canvas_fills_the_shell(cx: &mut gpui_kit::TestAppContext) {
+        let measured = Rc::new(Cell::new((0.0f32, 0.0f32)));
+        let image = backdrop();
+        let mut layers = super::layers(CARD_RADIUS, Some((&image, 0.5)));
+        let rim = layers.pop().unwrap();
+        let slot = Rc::clone(&measured);
+        let rim = rim.on_children_prepainted(move |children, _, _| {
+            if let Some(bounds) = children.last() {
+                slot.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+            }
+        });
+        cx.add_empty_window().draw(
+            point(px(0.0), px(0.0)),
+            size(px(CARD_WIDTH), px(CARD_HEIGHT)),
+            move |_window, _app| div().size_full().relative().child(rim).into_any_element(),
+        );
+        let (width, height) = measured.get();
+        assert!(
+            (width - CARD_WIDTH).abs() < 0.01,
+            "rim canvas width {width} does not fill the {CARD_WIDTH}px shell"
+        );
+        assert!(
+            (height - CARD_HEIGHT).abs() < 0.01,
+            "rim canvas height {height} does not fill the {CARD_HEIGHT}px shell"
+        );
     }
 
     fn near(got: f32, want: f32) {
