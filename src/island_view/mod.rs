@@ -493,7 +493,7 @@ impl IslandView {
                 .background_executor()
                 .spawn(async move {
                     let screen = wallpaper::screen_size();
-                    wallpaper::build(screen, rect)
+                    wallpaper::build(screen, rect, scale)
                 })
                 .await;
             view.update(cx, |view, cx| {
@@ -974,7 +974,7 @@ impl IslandView {
             .child(glass::frost(
                 frost_shape,
                 self.state,
-                self.glass.as_ref().map(|backdrop| &backdrop.image),
+                self.glass.as_ref(),
             ))
             .child(island)
     }

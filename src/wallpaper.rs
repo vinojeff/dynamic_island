@@ -30,7 +30,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// Box-blur radius, physical pixels. Three passes of this approximate a
 /// Gaussian wide enough to read as frost, and wide enough that a stale frame
 /// of a video wallpaper is indistinguishable.
-pub const BLUR_RADIUS: usize = 12;
+pub const BLUR_RADIUS: usize = 9;
+
+/// Blur radius of the lens copy, physical pixels.
+///
+/// The rim bends the desktop, so it has to keep the structure it bends:
+/// painting the frosted face into the lens band would hide the displacement
+/// entirely. Two pixels of blur still reads as polished glass.
+pub const LENS_BLUR_RADIUS: usize = 2;
 
 /// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
 pub const SATURATION: f32 = 1.15;
@@ -75,14 +82,31 @@ impl WallpaperPosition {
     }
 }
 
+/// How much wallpaper the crop keeps around the stage, logical pixels.
+///
+/// The edge lens samples the desktop *outside* the panel; the margin is the
+/// distance it can reach. Must exceed the lens pull in `island_view::glass`.
+pub const REFRACTION_MARGIN: f32 = 40.0;
+
 /// A frosted wallpaper crop ready to paint. Built on the background executor
 /// and swapped into the view as one value.
 #[derive(Clone)]
 pub struct GlassBackdrop {
-    /// The blurred crop, matched one-to-one to the stage rect.
+    /// The blurred crop, one-to-one with the stage plus a lens margin.
     pub image: Arc<RenderImage>,
+    /// The same crop with only [`LENS_BLUR_RADIUS`], for the refracting rim.
+    ///
+    /// The rim has to keep the structure it displaces, so it cannot borrow
+    /// the frosted face; the two are the same geometry, so a ring can swap
+    /// between them without shifting.
+    pub lens: Arc<RenderImage>,
     /// Mean lightness of the crop, 0.0 dark .. 1.0 bright. Drives the scrim.
     pub luma: f32,
+    /// Logical margin around the stage, `(left, top, right, bottom)`.
+    ///
+    /// Zero on a side where the stage touches a display edge, so the lens
+    /// knows it cannot sample past the screen.
+    pub pad: (f32, f32, f32, f32),
 }
 
 /// What makes the frosted crop stale: the wallpaper file AND the stage rect.
@@ -234,9 +258,13 @@ pub fn screen_size() -> (u32, u32) {
 /// bytes, degenerate rect — yields `None`, and the caller still records the
 /// fingerprint so a broken wallpaper does not re-trigger a decode every poll.
 #[must_use]
-pub fn build(display: (u32, u32), rect: (i32, i32, u32, u32)) -> Option<GlassBackdrop> {
+pub fn build(
+    display: (u32, u32),
+    rect: (i32, i32, u32, u32),
+    scale: f32,
+) -> Option<GlassBackdrop> {
     let fingerprint = fingerprint_now(rect)?;
-    if display.0 == 0 || display.1 == 0 {
+    if display.0 == 0 || display.1 == 0 || !scale.is_finite() || scale <= 0.0 {
         return None;
     }
     let bytes = std::fs::read(&fingerprint.path).ok()?;
@@ -246,22 +274,49 @@ pub fn build(display: (u32, u32), rect: (i32, i32, u32, u32)) -> Option<GlassBac
         .decode()
         .ok()?
         .to_rgba8();
-    // Draw the wallpaper the way Windows does, then crop the stage out of
-    // that display-sized canvas. The crop is one-to-one with the desktop.
+    // Draw the wallpaper the way Windows does, then crop the stage *plus* a
+    // margin out of that display-sized canvas. The lens reads the margin to
+    // bend the desktop outside the panel into the rim.
     let composed = compose(&wall, display, fingerprint.position);
-    let (x, y, w, h) = stage_crop((composed.width(), composed.height()), rect)?;
-    let mut crop_raw = image::imageops::crop_imm(&composed, x, y, w, h)
+    let (sx, sy, sw, sh) = stage_crop((composed.width(), composed.height()), rect)?;
+    // Widening display-sized integers into f32 loses nothing that matters.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    let margin = (REFRACTION_MARGIN * scale).round().max(0.0) as u32;
+    let left = sx.saturating_sub(margin);
+    let top = sy.saturating_sub(margin);
+    let right = (sx + sw + margin).min(composed.width());
+    let bottom = (sy + sh + margin).min(composed.height());
+    let w = right.saturating_sub(left);
+    let h = bottom.saturating_sub(top);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut crop_raw = image::imageops::crop_imm(&composed, left, top, w, h)
         .to_image()
         .into_raw();
     let cw = w as usize;
     let ch = h as usize;
-    blur3(&mut crop_raw, cw, ch, BLUR_RADIUS);
     saturate(&mut crop_raw, SATURATION);
+    // The rim keeps a lightly blurred copy so the lens has structure to bend.
+    let mut lens_raw = crop_raw.clone();
+    blur3(&mut lens_raw, cw, ch, LENS_BLUR_RADIUS);
+    blur3(&mut crop_raw, cw, ch, BLUR_RADIUS);
     let luma = mean_luma(&crop_raw);
     let frame = frame_from_rgba(cw, ch, &crop_raw)?;
+    let lens_frame = frame_from_rgba(cw, ch, &lens_raw)?;
+    // The lens works in logical pixels; the pad is physical pixels / scale.
+    #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
+    let pad = (
+        (sx - left) as f32 / scale,
+        (sy - top) as f32 / scale,
+        (right - (sx + sw)) as f32 / scale,
+        (bottom - (sy + sh)) as f32 / scale,
+    );
     Some(GlassBackdrop {
         image: Arc::new(RenderImage::new(smallvec::smallvec![frame])),
+        lens: Arc::new(RenderImage::new(smallvec::smallvec![lens_frame])),
         luma,
+        pad,
     })
 }
 
