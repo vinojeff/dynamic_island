@@ -70,7 +70,7 @@ where
     M: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 {
     let Face {
-        shape, playing, tab, volume, volume_visible, state, notice, badge, media_line,
+        shape, playing, tab, volume, volume_visible, bt_notice, state, notice, badge, media_line,
         media_playing, cover, progress, position_secs, duration_secs, track_hot, album_line,
         transport, modes, sessions, seekable, sessions_open, perf, page_slide, glass, glass_luma,
     } = face.clone();
@@ -94,7 +94,9 @@ where
             body.cursor_pointer().on_mouse_down(MouseButton::Left, toggle)
         })
         .when(state != IslandState::Card, |body| {
-            if volume_visible && volume.available {
+            if bt_notice && notice.is_none() && volume.available {
+                body.child(bt_notice_row(volume, mute))
+            } else if volume_visible && volume.available {
                 body.child(volume_overlay(volume, mute))
             } else {
                 body.child(compact_row(playing, &title, tab, cover.clone(), 1.0, CapsuleEnds {
@@ -612,6 +614,48 @@ where
         )
 }
 
+/// Capsule contents while a Bluetooth headset just became the output.
+fn bt_notice_row<M>(volume: VolumeState, mute: M) -> gpui_kit::Div
+where
+    M: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+{
+    let fill = if volume.muted {
+        theme::track(0.45)
+    } else {
+        theme::fill(0.90)
+    };
+    div()
+        .absolute()
+        .size_full()
+        .flex()
+        .items_center()
+        .px(px(14.0))
+        .gap(px(10.0))
+        .child(
+            div()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, mute)
+                .child(headphones()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(13.0))
+                        .child("蓝牙耳机")
+                        .child(format!("{}%", volume.percent())),
+                )
+                .child(thin_meter(volume.level, fill)),
+        )
+}
+
 fn thin_meter(level: f32, fill: gpui_kit::Hsla) -> gpui_kit::Div {
     let level = level.clamp(0.0, 1.0);
     div()
@@ -625,6 +669,63 @@ fn thin_meter(level: f32, fill: gpui_kit::Hsla) -> gpui_kit::Div {
                 .h_full()
                 .rounded(px(2.0))
                 .bg(fill),
+        )
+}
+
+fn headphones() -> gpui_kit::Div {
+    div()
+        .w(px(18.0))
+        .h(px(16.0))
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(2.0))
+                .w(px(14.0))
+                .h(px(2.0))
+                .rounded(px(1.0))
+                .bg(rgb(theme::INK)),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .w(px(2.0))
+                .h(px(9.0))
+                .rounded(px(1.0))
+                .bg(rgb(theme::INK)),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .right(px(1.0))
+                .w(px(2.0))
+                .h(px(9.0))
+                .rounded(px(1.0))
+                .bg(rgb(theme::INK)),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(0.0))
+                .left(px(0.0))
+                .w(px(4.0))
+                .h(px(7.0))
+                .rounded(px(2.0))
+                .bg(rgb(theme::INK)),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(4.0))
+                .h(px(7.0))
+                .rounded(px(2.0))
+                .bg(rgb(theme::INK)),
         )
 }
 

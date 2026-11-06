@@ -50,7 +50,7 @@ use rustedge::perf::{self, PerfHistory};
 use rustedge::island::{
     self, Hover, IslandState, Morph, Tab, Wheel, resting,
 };
-use rustedge::volume::{self, Endpoint, Reading, VolumeCommand, VolumeState};
+use rustedge::volume::{self, Endpoint, VolumeCommand, VolumeState};
 
 /// The liquid-glass optics: lens underlay, scrim, sheen, rim, dispersion.
 mod glass;
@@ -71,6 +71,8 @@ struct Face {
     tab: Tab,
     volume: VolumeState,
     volume_visible: bool,
+    /// A Bluetooth headset just became the default output.
+    bt_notice: bool,
     state: IslandState,
     notice: Option<Notice>,
     badge: bool,
@@ -126,6 +128,10 @@ pub struct IslandView {
     volume: VolumeState,
     /// Endpoint thread. `None` until the window is armed.
     endpoint: Option<Endpoint>,
+    /// The default render endpoint generation the view has seen.
+    device_epoch: Option<u64>,
+    /// Monotonic millisecond when the Bluetooth connection hint should hide.
+    bt_notice_until: Option<u64>,
     /// Leftover touchpad delta, in wheel steps.
     wheel_pending: f32,
     /// Monotonic millisecond when the wheel overlay should hide.
@@ -211,6 +217,8 @@ impl IslandView {
             tab: Tab::Media,
             volume: VolumeState::unavailable(),
             endpoint: None,
+            device_epoch: None,
+            bt_notice_until: None,
             wheel_pending: 0.0,
             overlay_until: None,
             dwell_since: None,
@@ -267,6 +275,9 @@ impl IslandView {
     /// is not interrupted; the toast waits and the badge lights.
     #[allow(dead_code)]
     pub fn push_notice(&mut self, notice: Notice, cx: &mut Context<Self>) {
+        // A system notification outranks the Bluetooth hint, and the hint does
+        // not come back after the toast leaves.
+        self.bt_notice_until = None;
         let panel = self.state == IslandState::Card;
         let id = notice.id;
         self.notices.push(notice, panel);
@@ -755,6 +766,7 @@ impl IslandView {
                 ..self.volume
             },
             volume_visible: self.overlay_until.is_some_and(|until| millis_now() < until),
+            bt_notice: self.bt_notice_until.is_some_and(|until| millis_now() < until),
             state: self.state,
             notice: if self.exclusive {
                 None
@@ -982,7 +994,10 @@ impl IslandView {
 
 impl IslandView {
     fn schedule_tuck(&mut self, cx: &mut Context<Self>) {
-        if self.state != IslandState::Capsule || !matches!(self.notices.content(), Content::Media) {
+        if self.state != IslandState::Capsule
+            || !matches!(self.notices.content(), Content::Media)
+            || self.bt_notice_until.is_some()
+        {
             return;
         }
         self.hover_ticket = self.hover_ticket.saturating_add(1);
@@ -1147,15 +1162,52 @@ impl IslandView {
         cx.notify();
     }
 
+    /// Expands the capsule and shows the Bluetooth hint for the notice hold.
+    fn flash_bluetooth(&mut self, cx: &mut Context<Self>) {
+        if self.state == IslandState::Card || self.exclusive {
+            return;
+        }
+        let until = millis_now().saturating_add(rustedge::notice::NOTICE_HOLD_MS);
+        self.bt_notice_until = Some(until);
+        if self.state == IslandState::Line {
+            self.go(IslandState::Capsule);
+        }
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(rustedge::notice::NOTICE_HOLD_MS))
+                .await;
+            view.update(cx, |view, cx| view.finish_bluetooth(until, cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_bluetooth(&mut self, until: u64, cx: &mut Context<Self>) {
+        if self.bt_notice_until != Some(until) {
+            return;
+        }
+        self.bt_notice_until = None;
+        cx.notify();
+    }
+
     fn poll_volume(&mut self, cx: &mut Context<Self>) {
         let reading = self.endpoint.as_ref().and_then(Endpoint::poll);
-        if let Some(Reading { level, muted, available }) = reading {
-            let changed = (self.volume.level - level).abs() > 0.001
-                || self.volume.muted != muted
-                || self.volume.available != available;
-            self.volume.level = level;
-            self.volume.muted = muted;
-            self.volume.available = available;
+        if let Some(reading) = reading {
+            if volume::announces_connection(self.device_epoch, &reading) {
+                self.flash_bluetooth(cx);
+            }
+            if self
+                .device_epoch
+                .is_none_or(|epoch| reading.device_epoch > epoch)
+            {
+                self.device_epoch = Some(reading.device_epoch);
+            }
+            let changed = (self.volume.level - reading.level).abs() > 0.001
+                || self.volume.muted != reading.muted
+                || self.volume.available != reading.available;
+            self.volume.level = reading.level;
+            self.volume.muted = reading.muted;
+            self.volume.available = reading.available;
             if changed {
                 cx.notify();
             }

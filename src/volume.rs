@@ -15,24 +15,53 @@
 //! that same thread copies the scalar and the mute bit into a `Reading`. It
 //! does not call back into the view.
 //!
+//! The same thread re-reads the default render endpoint every [`DEVICE_POLL`].
+//! A changed device id drops the old callback, activates the new endpoint, and
+//! publishes a reading with a higher `device_epoch`. A Bluetooth headset gets
+//! `bluetooth_headset` set; the view turns a rising epoch into the connection
+//! hint. The class checks live in [`is_bluetooth_enumerator`] and
+//! [`is_headset_form_factor`]; [`announces_connection`] decides the hint.
+//!
 //! Drop drops the command sender before joining. The STA is blocked in
-//! `recv`; joining first deadlocks. The view keeps the overlay up for
+//! `recv_timeout`; joining first deadlocks. The view keeps the overlay up for
 //! [`OVERLAY_HOLD`] (1500ms) after the last accepted step. `VOLUME_HOLD_MS`
 //! in `island` is a different constant and is not this timer.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    AUDIO_VOLUME_NOTIFICATION_DATA, IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender,
+    AUDIO_VOLUME_NOTIFICATION_DATA, Handset, Headphones, Headset, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, eMultimedia, eRender,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::core::BOOL;
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoTaskMemFree, CoUninitialize, STGM_READ,
+};
+use windows::Win32::System::Variant::{VT_LPWSTR, VT_UI4};
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::{BOOL, GUID};
 use windows_implement::implement;
+
+/// `PKEY_Device_EnumeratorName`. The windows crate does not export property
+/// keys, so the fmtid and pid are spelled out here.
+const PKEY_DEVICE_ENUMERATOR_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0xa45c_254e_df1c_4efd_8020_67d1_46a8_50e0),
+    pid: 24,
+};
+
+/// `PKEY_AudioEndpoint_FormFactor`. `PROPVARIANT::ulVal` is a
+/// `EndpointFormFactor` value.
+const PKEY_AUDIOENDPOINT_FORMFACTOR: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x1da5_d803_d492_4edd_8c23_e0c0_ffee_7f0e),
+    pid: 0,
+};
 
 /// How long the wheel overlay stays up after the last accepted step.
 pub const OVERLAY_HOLD: Duration = Duration::from_millis(1_500);
@@ -201,14 +230,62 @@ pub struct Reading {
     pub muted: bool,
     /// `false` when no render device could be opened.
     pub available: bool,
+    /// Endpoint generation. `0` means no device; each change adds one.
+    pub device_epoch: u64,
+    /// The default render endpoint is a Bluetooth headset.
+    pub bluetooth_headset: bool,
 }
 
 impl Reading {
     /// No device. The capsule hides volume UI.
     #[must_use]
     pub const fn unavailable() -> Self {
-        Self { level: 0.0, muted: false, available: false }
+        Self {
+            level: 0.0,
+            muted: false,
+            available: false,
+            device_epoch: 0,
+            bluetooth_headset: false,
+        }
     }
+
+    /// No device at a later generation. The epoch move lets the view hide the
+    /// overlay without mistaking the loss for the initial baseline.
+    const fn missing(device_epoch: u64) -> Self {
+        Self {
+            level: 0.0,
+            muted: false,
+            available: false,
+            device_epoch,
+            bluetooth_headset: false,
+        }
+    }
+}
+
+/// Whether the default endpoint changed to a usable Bluetooth headset.
+///
+/// The first reading only sets the baseline: an app that starts with the
+/// headset already connected must not greet the user.
+#[must_use]
+pub fn announces_connection(previous: Option<u64>, reading: &Reading) -> bool {
+    previous.is_some_and(|epoch| reading.device_epoch > epoch)
+        && reading.bluetooth_headset
+        && reading.available
+}
+
+/// Whether a device enumerator names a Bluetooth transport.
+///
+/// Windows reports `BTHENUM` for classic Bluetooth and `BTHLE` for LE Audio;
+/// both, and any future `BTH` variant, count.
+#[must_use]
+pub fn is_bluetooth_enumerator(name: &str) -> bool {
+    name.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("BTH"))
+}
+
+/// Whether an endpoint form factor is worn on the ears.
+#[must_use]
+pub fn is_headset_form_factor(form_factor: i32) -> bool {
+    form_factor == Headphones.0 || form_factor == Headset.0 || form_factor == Handset.0
 }
 
 /// Owns the endpoint thread. Drop closes the command channel and joins.
@@ -262,49 +339,199 @@ impl Drop for Endpoint {
     }
 }
 
+/// How often the endpoint thread checks for a different default render device.
+pub const DEVICE_POLL: Duration = Duration::from_millis(500);
+
+/// A render endpoint the thread is bound to. Drop unregisters the callback.
+struct BoundEndpoint {
+    device_epoch: u64,
+    bluetooth_headset: bool,
+    volume: IAudioEndpointVolume,
+    callback: IAudioEndpointVolumeCallback,
+}
+
+impl Drop for BoundEndpoint {
+    fn drop(&mut self) {
+        // SAFETY: `callback` is the interface registered in `bind_device`.
+        let _removed = unsafe { self.volume.UnregisterControlChangeNotify(&self.callback) };
+    }
+}
+
 fn run_endpoint(commands: &Receiver<VolumeCommand>, readings: &Sender<Reading>) {
     // SAFETY: this thread has not initialized COM. STA matches the audio
     // endpoint, which is not `Send`. Uninitialize only when this call succeeded.
     let apartment = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    let endpoint = open_endpoint();
-    let Some(volume) = endpoint else {
+    let Some(enumerator) = create_enumerator() else {
         let _sent = readings.send(Reading::unavailable());
+        uninitialize(apartment);
         return;
     };
-    publish(&volume, readings);
-    let callback = VolumeCallback { readings: readings.clone() };
+    let mut epoch = 0_u64;
+    let mut last_id: Option<String> = None;
+    let mut bound = if let Some(device) = default_device(&enumerator) {
+        epoch = 1;
+        last_id = device_id(&device);
+        let bound = last_id
+            .as_ref()
+            .and_then(|_| bind_device(&device, epoch, readings));
+        if bound.is_none() {
+            let _sent = readings.send(Reading::missing(epoch));
+        }
+        bound
+    } else {
+        let _sent = readings.send(Reading::unavailable());
+        None
+    };
+    let mut checked = Instant::now();
+    loop {
+        let wait = DEVICE_POLL.saturating_sub(checked.elapsed());
+        match commands.recv_timeout(wait) {
+            Ok(command) => {
+                if let Some(endpoint) = &bound {
+                    apply(&endpoint.volume, command);
+                    publish(endpoint, readings);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if checked.elapsed() < DEVICE_POLL {
+            continue;
+        }
+        checked = Instant::now();
+        let next = default_device(&enumerator);
+        let next_id = next.as_ref().and_then(device_id);
+        // Retry a device that is present but not bound yet; skip an unchanged
+        // one that is already bound, or a missing one that was missing before.
+        if next_id == last_id && (bound.is_some() || next.is_none()) {
+            continue;
+        }
+        drop(bound.take());
+        // Either the device changed, or it is present but not bound yet. Both
+        // are a new generation, so a retry that finally activates can announce.
+        epoch = epoch.saturating_add(1);
+        last_id = next_id;
+        bound = match &next {
+            Some(device) => {
+                last_id
+                    .as_ref()
+                    .and_then(|_| bind_device(device, epoch, readings))
+            }
+            None => None,
+        };
+        if bound.is_none() {
+            let _sent = readings.send(Reading::missing(epoch));
+        }
+    }
+    drop(bound);
+    drop(enumerator);
+    uninitialize(apartment);
+}
+
+/// Creates the default-endpoint enumerator. It stays on this thread.
+fn create_enumerator() -> Option<IMMDeviceEnumerator> {
+    // SAFETY: COM is initialized on this thread. The enumerator is in-proc and
+    // stays on this thread.
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) }.ok()
+}
+
+fn default_device(enumerator: &IMMDeviceEnumerator) -> Option<IMMDevice> {
+    // SAFETY: `eRender` + `eMultimedia` is the documented default playback endpoint.
+    unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) }.ok()
+}
+
+fn bind_device(
+    device: &IMMDevice,
+    device_epoch: u64,
+    readings: &Sender<Reading>,
+) -> Option<BoundEndpoint> {
+    let bluetooth_headset = is_bluetooth_headset(device);
+    // SAFETY: `IAudioEndpointVolume` is the activation contract for a render device.
+    let volume =
+        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_INPROC_SERVER, None) }.ok()?;
+    let callback = VolumeCallback {
+        readings: readings.clone(),
+        device_epoch,
+        bluetooth_headset,
+    };
     let callback: IAudioEndpointVolumeCallback = callback.into();
-    // SAFETY: `callback` outlives the registration. It is unregistered before drop.
-    let registered = unsafe { volume.RegisterControlChangeNotify(&callback) }.is_ok();
-    while let Ok(command) = commands.recv() {
-        apply(&volume, command);
-        publish(&volume, readings);
+    // SAFETY: `callback` lives in the returned struct; Drop unregisters it.
+    let _registered = unsafe { volume.RegisterControlChangeNotify(&callback) }.is_ok();
+    let endpoint = BoundEndpoint {
+        device_epoch,
+        bluetooth_headset,
+        volume,
+        callback,
+    };
+    publish(&endpoint, readings);
+    Some(endpoint)
+}
+
+/// Frees the COM string. `PWSTR::to_string` does not take ownership.
+fn device_id(device: &IMMDevice) -> Option<String> {
+    // SAFETY: `GetId` allocates a NUL-terminated string with the task allocator.
+    let raw = unsafe { device.GetId() }.ok()?;
+    // SAFETY: `raw` is a live NUL-terminated string for the duration of this call.
+    let text = unsafe { raw.to_string() }.ok();
+    // SAFETY: `raw` came from `GetId` and is not used after this call.
+    unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+    text
+}
+
+fn is_bluetooth_headset(device: &IMMDevice) -> bool {
+    // SAFETY: `OpenPropertyStore` reads from the device without changing it.
+    let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else {
+        return false;
+    };
+    let enumerator = property_string(&store, &PKEY_DEVICE_ENUMERATOR_NAME).unwrap_or_default();
+    if !is_bluetooth_enumerator(&enumerator) {
+        return false;
     }
-    if registered {
-        // SAFETY: `callback` is the same interface that was registered.
-        let _removed = unsafe { volume.UnregisterControlChangeNotify(&callback) };
-    }
-    drop(callback);
-    drop(volume);
+    property_u32(&store, &PKEY_AUDIOENDPOINT_FORMFACTOR)
+        .and_then(|form| i32::try_from(form).ok())
+        .is_some_and(is_headset_form_factor)
+}
+
+fn property_string(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<String> {
+    // SAFETY: `store` is a live property store and `key` a valid PROPERTYKEY.
+    let mut value = unsafe { store.GetValue(key) }.ok()?;
+    // SAFETY: the tag decides which union arm may be read. `pwszVal` is a
+    // borrowed, NUL-terminated string that is copied before the clear below.
+    let text = unsafe {
+        let inner = &value.Anonymous.Anonymous;
+        if inner.vt == VT_LPWSTR {
+            inner.Anonymous.pwszVal.to_string().ok()
+        } else {
+            None
+        }
+    };
+    // SAFETY: `value` came from `GetValue` and is cleared exactly once.
+    unsafe { let _cleared = PropVariantClear(&raw mut value); }
+    text
+}
+
+fn property_u32(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<u32> {
+    // SAFETY: `store` is a live property store and `key` a valid PROPERTYKEY.
+    let mut value = unsafe { store.GetValue(key) }.ok()?;
+    // SAFETY: the tag decides which union arm may be read.
+    let number = unsafe {
+        let inner = &value.Anonymous.Anonymous;
+        (inner.vt == VT_UI4).then(|| inner.Anonymous.ulVal)
+    };
+    // SAFETY: `value` came from `GetValue` and is cleared exactly once.
+    unsafe { let _cleared = PropVariantClear(&raw mut value); }
+    number
+}
+
+/// Balances a successful `CoInitializeEx`.
+fn uninitialize(apartment: windows::core::HRESULT) {
     // SAFETY: `CoInitializeEx` succeeded or returned a changed-mode that still
-    // leaves this thread in an apartment. Uninitialize balances a successful init.
-    // A failed init returns `RPC_E_CHANGED_MODE` only when COM is already up,
-    // in which case uninitialize would unbalance the outer owner, so skip it.
+    // leaves this thread in an apartment. Uninitialize balances a successful
+    // init. A failed init returns `RPC_E_CHANGED_MODE` only when COM is already
+    // up, in which case uninitialize would unbalance the outer owner, so skip it.
     if apartment.is_ok() {
         unsafe { CoUninitialize() };
     }
-}
-
-fn open_endpoint() -> Option<IAudioEndpointVolume> {
-    // SAFETY: COM is initialized on this thread. The enumerator is in-proc and
-    // stays on this thread.
-    let enumerator: IMMDeviceEnumerator = unsafe {
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)
-    }.ok()?;
-    // SAFETY: `eRender` + `eMultimedia` is the documented default playback endpoint.
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) }.ok()?;
-    // SAFETY: `IAudioEndpointVolume` is the activation contract for a render device.
-    unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_INPROC_SERVER, None) }.ok()
 }
 
 fn apply(volume: &IAudioEndpointVolume, command: VolumeCommand) {
@@ -326,23 +553,27 @@ fn apply(volume: &IAudioEndpointVolume, command: VolumeCommand) {
     }
 }
 
-fn publish(volume: &IAudioEndpointVolume, readings: &Sender<Reading>) {
-    let Ok(level) = (unsafe { volume.GetMasterVolumeLevelScalar() }) else {
+fn publish(endpoint: &BoundEndpoint, readings: &Sender<Reading>) {
+    let Ok(level) = (unsafe { endpoint.volume.GetMasterVolumeLevelScalar() }) else {
         return;
     };
-    let Ok(muted) = (unsafe { volume.GetMute() }) else {
+    let Ok(muted) = (unsafe { endpoint.volume.GetMute() }) else {
         return;
     };
     let _sent = readings.send(Reading {
         level: level.clamp(0.0, 1.0),
         muted: muted.as_bool(),
         available: true,
+        device_epoch: endpoint.device_epoch,
+        bluetooth_headset: endpoint.bluetooth_headset,
     });
 }
 
 #[implement(IAudioEndpointVolumeCallback)]
 struct VolumeCallback {
     readings: Sender<Reading>,
+    device_epoch: u64,
+    bluetooth_headset: bool,
 }
 
 impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
@@ -358,6 +589,8 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
             level: data.fMasterVolume.clamp(0.0, 1.0),
             muted: data.bMuted.as_bool(),
             available: true,
+            device_epoch: self.device_epoch,
+            bluetooth_headset: self.bluetooth_headset,
         });
         Ok(())
     }
@@ -366,9 +599,20 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
 #[cfg(test)]
 mod tests {
     use super::{
-        VolumeCommand, VolumeIcon, VolumeState, accumulate_wheel, slider_applies, slider_due,
-        slider_level, wheel_applies,
+        Reading, VolumeCommand, VolumeIcon, VolumeState, accumulate_wheel, announces_connection,
+        is_bluetooth_enumerator, is_headset_form_factor, slider_applies, slider_due, slider_level,
+        wheel_applies,
     };
+
+    fn reading(epoch: u64, bluetooth_headset: bool, available: bool) -> Reading {
+        Reading {
+            level: 0.5,
+            muted: false,
+            available,
+            device_epoch: epoch,
+            bluetooth_headset,
+        }
+    }
 
     #[test]
     fn a_line_up_raises_the_scalar_by_two_percent() {
@@ -458,5 +702,49 @@ mod tests {
         assert!(!slider_applies(false, true, true));
         assert!(slider_applies(false, true, false));
         assert!(!slider_applies(true, true, false));
+    }
+
+    #[test]
+    fn bluetooth_enumerators_are_recognized() {
+        assert!(is_bluetooth_enumerator("BTHENUM"));
+        assert!(is_bluetooth_enumerator("bthle"));
+        assert!(is_bluetooth_enumerator("BTHHFENUM"));
+        assert!(!is_bluetooth_enumerator("USB"));
+        assert!(!is_bluetooth_enumerator("HDAUDIO"));
+        assert!(!is_bluetooth_enumerator(""));
+    }
+
+    #[test]
+    fn only_ear_worn_form_factors_count_as_a_headset() {
+        assert!(is_headset_form_factor(3));
+        assert!(is_headset_form_factor(5));
+        assert!(is_headset_form_factor(6));
+        assert!(!is_headset_form_factor(1));
+        assert!(!is_headset_form_factor(2));
+        assert!(!is_headset_form_factor(9));
+        assert!(!is_headset_form_factor(0));
+    }
+
+    #[test]
+    fn the_first_reading_only_sets_the_baseline() {
+        assert!(!announces_connection(None, &reading(1, true, true)));
+    }
+
+    #[test]
+    fn switching_to_a_bluetooth_headset_announces() {
+        assert!(announces_connection(Some(1), &reading(2, true, true)));
+        assert!(announces_connection(Some(2), &reading(3, true, true)));
+    }
+
+    #[test]
+    fn switching_away_or_to_a_speaker_stays_quiet() {
+        assert!(!announces_connection(Some(1), &reading(2, false, true)));
+    }
+
+    #[test]
+    fn an_unchanged_or_unavailable_reading_stays_quiet() {
+        assert!(!announces_connection(Some(1), &reading(1, true, true)));
+        assert!(!announces_connection(Some(1), &reading(2, true, false)));
+        assert!(!announces_connection(Some(3), &reading(2, true, true)));
     }
 }
