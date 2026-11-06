@@ -5,14 +5,14 @@
 //!
 //! | Flutter vocabulary | Here |
 //! | --- | --- |
-//! | blur (frost) | the frosted wallpaper crop [`frost`] paints below everything |
-//! | refraction (index, width) | the Fresnel rim bands, [`rim_alpha`] |
+//! | blur (frost) | none: the crisp wallpaper crop [`lens`] bends |
+//! | refraction (index, width) | the whole-panel lens, [`paint_lens`] |
 //! | dispersion | warm/cool fringe halves riding the rim, [`DISPERSION`] |
 //! | specular (angle, spread) | the diagonal white streak, two stacked two-stop gradients |
 //! | saturation | boosted while cropping, [`crate::wallpaper::SATURATION`] |
-//! | adaptivity | the scrim follows the crop's luma, [`plate_alpha`] |
+//! | adaptivity | the scrim follows the crop's luma, [`veil_alpha`] |
 //!
-//! [`frost`] spans the root and paints once; [`layers`] are the shell's own
+//! [`lens`] spans the root and paints once; [`layers`] are the shell's own
 //! underlays, painted before the body so content stays above every optic.
 
 use std::sync::Arc;
@@ -50,19 +50,18 @@ pub(super) const IDLE_LUMA: f32 = 0.35;
 /// How many concentric bands the rim renders, bright rim inward.
 const RIM_BANDS: usize = 3;
 
-/// Depth of the lens band inside the silhouette, logical pixels.
-pub(super) const REFRACTION_DEPTH: f32 = 18.0;
-
-/// Rings used to approximate the lens falloff. Twenty-four 0.75px bands put
-/// the seam step at `REFRACTION_PULL / REFRACTION_STEPS`, small enough that no
-/// ring reads as a jump.
-const REFRACTION_STEPS: usize = 24;
+/// How many concentric bands the panel is drawn in.
+///
+/// The bands are much wider than the old 0.75px rim ones (the pull is spread
+/// over the whole panel now), but the displacement step between neighbours is
+/// `REFRACTION_PULL / LENS_RINGS` — under 0.6px, so no band reads as a jump.
+const LENS_RINGS: usize = 64;
 
 /// How far the wallpaper is pulled outward at the silhouette, logical pixels.
 ///
-/// The band is [`REFRACTION_DEPTH`] deep, so the rim reads a 34px strip of
-/// desktop compressed into 18px — that squeeze is what makes a lens read as
-/// thick glass rather than as a plain blur. Must stay under
+/// The pull tapers to zero at the centre, so the rim reads the desktop outside
+/// the panel while the middle stays put. That squeeze is what makes a lens
+/// read as thick glass rather than as a plain blur. Must stay under
 /// [`crate::wallpaper::REFRACTION_MARGIN`].
 const REFRACTION_PULL: f32 = 34.0;
 
@@ -73,14 +72,24 @@ pub(super) fn veil_alpha(luma: f32) -> f32 {
     (0.26 - 0.10 * luma).clamp(0.16, 0.26)
 }
 
+/// How far the lens reaches inside the silhouette: all the way to the middle
+/// of the shorter side, so the whole panel bends instead of just a rim.
+#[must_use]
+pub(super) fn refraction_depth(width: f32, height: f32) -> f32 {
+    width.min(height) / 2.0
+}
+
 /// Outward pull of the lens `inset` logical pixels inside the silhouette.
 ///
-/// Maximal flush against the edge, zero at [`REFRACTION_DEPTH`]. The falloff
-/// is linear so neighbouring rings always differ by the same step and no band
-/// reads as a jump.
+/// Maximal flush against the edge, zero at [`refraction_depth`] — the middle.
+/// The falloff is linear so neighbouring rings always differ by the same step
+/// and no band reads as a jump.
 #[must_use]
-pub(super) fn refraction_pull(inset: f32) -> f32 {
-    let t = (1.0 - inset / REFRACTION_DEPTH).clamp(0.0, 1.0);
+pub(super) fn refraction_pull(inset: f32, depth: f32) -> f32 {
+    if depth <= 0.0 {
+        return 0.0;
+    }
+    let t = (1.0 - inset / depth).clamp(0.0, 1.0);
     REFRACTION_PULL * t
 }
 
@@ -91,7 +100,8 @@ pub(super) fn refraction_pull(inset: f32) -> f32 {
 /// `anchor + (p - anchor) * w / (w - 2 * pull)`: the rim reads the desktop
 /// outside the panel and compresses it inward, which is how a thick glass edge
 /// bends the world. `pull` must stay under the crop's margin or the lens would
-/// run off the edge of the image.
+/// run off the edge of the image; an axis that cannot afford it stays
+/// untouched while the other axis still bends.
 #[must_use]
 pub(super) fn lens_bounds(
     stage: (f32, f32, f32, f32),
@@ -99,17 +109,27 @@ pub(super) fn lens_bounds(
     pull: (f32, f32),
 ) -> (f32, f32, f32, f32) {
     let (left, top, width, height) = stage;
-    if width <= 2.0 * pull.0 || height <= 2.0 * pull.1 {
+    let fx = shrink_factor(width, pull.0);
+    let fy = shrink_factor(height, pull.1);
+    if (fx - 1.0).abs() <= f32::EPSILON && (fy - 1.0).abs() <= f32::EPSILON {
         return stage;
     }
-    let fx = (width - 2.0 * pull.0) / width;
-    let fy = (height - 2.0 * pull.1) / height;
     (
         anchor.0 + (left - anchor.0) * fx,
         anchor.1 + (top - anchor.1) * fy,
         width * fx,
         height * fy,
     )
+}
+
+/// Scale that moves one axis `pull` inward at both ends, or sticks at 1.0 when
+/// the pull would collapse the axis.
+fn shrink_factor(span: f32, pull: f32) -> f32 {
+    if span <= 2.0 * pull {
+        1.0
+    } else {
+        (span - 2.0 * pull) / span
+    }
 }
 
 /// Horizontal amount the shell sits right of the window's left edge.
@@ -169,21 +189,21 @@ pub(super) fn shell_shadows() -> Vec<BoxShadow> {
     ]
 }
 
-/// The frosted wallpaper under the shell, painted once at the root.
+/// The refracted wallpaper under the shell, painted once at the root.
 ///
 /// The canvas spans the whole window so its bounds match the stage one-to-one;
 /// `paint_image` then clips to the shell's rounded rect, which is what carries
 /// the silhouette (gpui's overflow mask is a plain rectangle). Empty when
 /// tucked as the line or before the first build lands — the fallback wash in
 /// [`layers`] takes over.
-pub(super) fn frost(
+pub(super) fn lens(
     shape: island::Morph,
     state: IslandState,
     backdrop: Option<&Arc<wallpaper::GlassBackdrop>>,
 ) -> gpui_kit::Div {
     let base = div().absolute().inset_0();
     // `chrome::paint` hands the tucked line to `line_glass` below 12px, so the
-    // frost must not paint a blurred sliver under it during the tuck morph.
+    // lens must not paint a wallpaper sliver under it during the tuck morph.
     if state == IslandState::Line || shape.height < 12.0 {
         return base;
     }
@@ -201,21 +221,21 @@ pub(super) fn frost(
         canvas(
             |_, _, _| (),
             move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-                paint_frost(bounds, (width, height), radius, &backdrop, window);
+                paint_lens(bounds, (width, height), radius, &backdrop, window);
             },
         )
         .size_full(),
     )
 }
 
-/// Paints the crop as one ring per [`REFRACTION_STEPS`] plus the flat centre.
+/// Paints the whole panel as one lens, one ring per [`LENS_RINGS`].
 ///
 /// Ring `k` clips the shell inset by `k * step` and draws the crop shrunk
 /// about the shell centre by that ring's [`refraction_pull`], so the rim reads
-/// the wallpaper *outside* the panel and compresses it inward. The rings use
-/// the sharp `rim` copy — the frosted `face` would blur the displacement away
-/// — and the centre is the untouched frosted crop.
-fn paint_frost(
+/// the wallpaper *outside* the panel and compresses it inward. The pull fades
+/// to nothing at the centre, so the warp spans the whole face and no flat
+/// frosted patch is left in the middle.
+fn paint_lens(
     bounds: Bounds<Pixels>,
     (width, height): (f32, f32),
     radius: Pixels,
@@ -251,12 +271,13 @@ fn paint_frost(
         pad.0.min(pad.2).min(REFRACTION_PULL),
         pad.1.min(pad.3).min(REFRACTION_PULL),
     );
+    let depth = refraction_depth(width, height);
     #[allow(
         clippy::cast_precision_loss,
-        reason = "REFRACTION_STEPS is 24; the quotient is exact in f32"
+        reason = "LENS_RINGS is 64; the quotient is exact in f32"
     )]
-    let step = REFRACTION_DEPTH / REFRACTION_STEPS as f32;
-    for ring in 0..REFRACTION_STEPS {
+    let step = depth / LENS_RINGS as f32;
+    for ring in 0..LENS_RINGS {
         #[allow(
             clippy::cast_precision_loss,
             reason = "the ring index is a small integer"
@@ -264,24 +285,16 @@ fn paint_frost(
         let inset = ring as f32 * step;
         // `refraction_pull` is the full-strength figure; scale it by how far
         // this panel may actually reach past its own edge.
-        let fade = refraction_pull(inset) / REFRACTION_PULL;
+        let fade = refraction_pull(inset, depth) / REFRACTION_PULL;
         let lean = (reach.0 * fade, reach.1 * fade);
         paint_crop(
             inset_shell(shell, inset),
             bounds_from(lens_bounds(stage, anchor, lean)),
             (radius - px(inset)).max(px(0.0)),
-            &backdrop.lens,
+            &backdrop.image,
             window,
         );
     }
-    // The centre keeps the frosted crop exactly as sampled: no lens, no pull.
-    paint_crop(
-        inset_shell(shell, REFRACTION_DEPTH),
-        natural,
-        (radius - px(REFRACTION_DEPTH)).max(px(0.0)),
-        &backdrop.image,
-        window,
-    );
 }
 
 /// One clipped draw of the crop. The shell's own corner radius is reduced by
@@ -327,11 +340,11 @@ fn bounds_from(rect: (f32, f32, f32, f32)) -> Bounds<Pixels> {
 /// Painted ahead of the body so text and controls sit on top of the glass.
 /// Each layer carries the shell's own corner radius: gpui's overflow mask is
 /// a plain rectangle (`ContentMask { bounds }`), so the silhouette has to
-/// come from every layer's own rounded background — same as [`frost`] clips
+/// come from every layer's own rounded background — same as [`lens`] clips
 /// through `paint_image`'s radii.
 ///
 /// With no backdrop yet, the scrim is the fallback wash — a light two-stop
-/// glass gradient standing in until the frosted crop arrives.
+/// glass gradient standing in until the wallpaper crop arrives.
 pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Vec<gpui_kit::Div> {
     let luma = glass.map_or(IDLE_LUMA, |(_, luma)| luma);
     let seeded = glass.is_some();
@@ -373,7 +386,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.05), 1.0),
         ));
-    // Same auto-size trap as the frost: without `size_full` the canvas is
+    // Same auto-size trap as the lens: without `size_full` the canvas is
     // zero-high and every `paint_ring` band fails its size guard.
     let rim = div().absolute().inset_0().child(
         canvas(
@@ -543,8 +556,7 @@ mod tests {
         )]));
         let margin = wallpaper::REFRACTION_MARGIN;
         Arc::new(wallpaper::GlassBackdrop {
-            image: Arc::clone(&image),
-            lens: image,
+            image,
             luma: 0.5,
             pad: (margin, margin, margin, margin),
         })
@@ -566,18 +578,19 @@ mod tests {
 
     #[test]
     fn the_lens_pulls_hardest_at_the_edge_and_stops_at_the_depth() {
-        assert_eq!(refraction_pull(0.0), REFRACTION_PULL);
-        assert_eq!(refraction_pull(REFRACTION_DEPTH), 0.0);
+        let depth = refraction_depth(CARD_WIDTH, CARD_HEIGHT);
+        assert_eq!(refraction_pull(0.0, depth), REFRACTION_PULL);
+        assert_eq!(refraction_pull(depth, depth), 0.0);
         assert_eq!(
-            refraction_pull(REFRACTION_DEPTH * 2.0),
+            refraction_pull(depth * 2.0, depth),
             0.0,
-            "past the band the crop is untouched"
+            "past the depth the crop is untouched"
         );
         let mut inset = 0.0;
-        while inset < REFRACTION_DEPTH {
-            let next = (inset + 0.5).min(REFRACTION_DEPTH);
+        while inset < depth {
+            let next = (inset + 0.5).min(depth);
             assert!(
-                refraction_pull(inset) > refraction_pull(next),
+                refraction_pull(inset, depth) > refraction_pull(next, depth),
                 "the pull must fall off inward at {inset}"
             );
             inset = next;
@@ -585,8 +598,29 @@ mod tests {
     }
 
     #[test]
+    fn the_lens_reaches_the_centre_of_the_shorter_side() {
+        // The card is 420x288, so the lens runs 144px in from every edge and
+        // meets itself on the vertical centreline: no flat patch survives.
+        let depth = refraction_depth(CARD_WIDTH, CARD_HEIGHT);
+        near(depth, CARD_HEIGHT / 2.0);
+        // The innermost ring must still cover the centre point, and adjacent
+        // rings must differ by well under a pixel of displacement.
+        let step = depth / LENS_RINGS as f32;
+        let innermost = (LENS_RINGS - 1) as f32 * step;
+        assert!(
+            depth - innermost <= step + 1e-4,
+            "a gap would leave the centre unpainted"
+        );
+        assert!(
+            REFRACTION_PULL / (LENS_RINGS as f32) < 1.0,
+            "a ring step would read as a jump"
+        );
+        assert!(step > 0.0);
+    }
+
+    #[test]
     fn the_lens_rect_samples_outside_the_silhouette() {
-        // The crop covers the stage plus a 26px margin on every side.
+        // The crop covers the stage plus the lens margin on every side.
         let stage = (-26.0, -26.0, 472.0, 412.0);
         let anchor = (210.0, 140.0);
         let pull = (20.0, 20.0);
@@ -601,7 +635,13 @@ mod tests {
         near(top + (anchor.1 - stage.1) * (height / stage.3), anchor.1);
         // No pull means identity.
         assert_eq!(lens_bounds(stage, anchor, (0.0, 0.0)), stage);
-        // A pull that would eat the crop is refused rather than inverted.
+        // A pull that would eat an axis is refused on that axis only, so the
+        // other one still bends.
+        let (left, top, width, height) = lens_bounds(stage, anchor, (300.0, 20.0));
+        near(left, stage.0);
+        near(width, stage.2);
+        assert!(top > stage.1 && height < stage.3);
+        // Both axes blocked: nothing to paint differently.
         assert_eq!(lens_bounds(stage, anchor, (300.0, 300.0)), stage);
     }
 
@@ -630,16 +670,16 @@ mod tests {
         near(shell_offset(260.0), expected);
     }
 
-    /// The frost is painted from a canvas. A bare `canvas()` has an auto
+    /// The lens is painted from a canvas. A bare `canvas()` has an auto
     /// height in a block parent and collapses to zero, which makes
-    /// `paint_image` bail on its empty visible rect: the frost silently never
+    /// `paint_image` bail on its empty visible rect: the lens silently never
     /// appears. Its bounds must be the whole stage.
     #[gpui_kit::test]
-    fn the_frost_canvas_fills_the_stage(cx: &mut gpui_kit::TestAppContext) {
+    fn the_lens_canvas_fills_the_stage(cx: &mut gpui_kit::TestAppContext) {
         let measured = Rc::new(Cell::new((0.0f32, 0.0f32)));
         let image = backdrop();
         let slot = Rc::clone(&measured);
-        let frost = super::frost(
+        let lens = super::lens(
             island::resting(IslandState::Card),
             IslandState::Card,
             Some(&image),
@@ -652,16 +692,16 @@ mod tests {
         cx.add_empty_window().draw(
             point(px(0.0), px(0.0)),
             size(px(STAGE_WIDTH as f32), px(STAGE_HEIGHT as f32)),
-            move |_window, _app| div().size_full().relative().child(frost).into_any_element(),
+            move |_window, _app| div().size_full().relative().child(lens).into_any_element(),
         );
         let (width, height) = measured.get();
         assert!(
             (width - STAGE_WIDTH as f32).abs() < 0.01,
-            "frost canvas width {width} does not fill the {STAGE_WIDTH}px stage"
+            "lens canvas width {width} does not fill the {STAGE_WIDTH}px stage"
         );
         assert!(
             (height - STAGE_HEIGHT as f32).abs() < 0.01,
-            "frost canvas height {height} does not fill the {STAGE_HEIGHT}px stage"
+            "lens canvas height {height} does not fill the {STAGE_HEIGHT}px stage"
         );
     }
 

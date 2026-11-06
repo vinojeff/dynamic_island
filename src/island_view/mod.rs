@@ -52,7 +52,7 @@ use rustedge::island::{
 };
 use rustedge::volume::{self, Endpoint, Reading, VolumeCommand, VolumeState};
 
-/// The liquid-glass optics: frost underlay, scrim, sheen, rim, dispersion.
+/// The liquid-glass optics: lens underlay, scrim, sheen, rim, dispersion.
 mod glass;
 mod chrome;
 mod media_page;
@@ -89,7 +89,7 @@ struct Face {
     sessions_open: bool,
     perf: PerfHistory,
     page_slide: f32,
-    /// The frosted wallpaper crop, when a build has landed.
+    /// The refracted wallpaper crop, when a build has landed.
     glass: Option<std::sync::Arc<gpui_kit::RenderImage>>,
     /// Lightness behind the glass; `glass::layers` turns it into scrim depth.
     glass_luma: f32,
@@ -161,7 +161,7 @@ pub struct IslandView {
     exclusive: bool,
     /// Physical top-left of the stage, captured from a window callback.
     stage_origin: Option<ScreenPoint>,
-    /// The frosted wallpaper crop. `None` until the first background build
+    /// The wallpaper crop. `None` until the first background build
     /// lands (the shell shows the fallback wash for one or two seconds after
     /// start — intended, see `glass::layers`).
     glass: Option<std::sync::Arc<wallpaper::GlassBackdrop>>,
@@ -432,7 +432,7 @@ impl IslandView {
         });
     }
 
-    /// Refreshes the frosted glass when the wallpaper or the stage moved.
+    /// Refreshes the glass backdrop when the wallpaper or the stage moved.
     ///
     /// One comparison per tick. When the fingerprint moves — the wallpaper
     /// file, or the window's physical rect after a slide or a DPI change —
@@ -862,12 +862,12 @@ impl IslandView {
         };
         let _ = &card_clicks;
 
-        // The morphing shape is what the frost must track; the resting shape
-        // covers the no-motion frame. Tucked, the frost paints nothing.
-        let mut frost_shape = resting(self.state);
+        // The morphing shape is what the lens must track; the resting shape
+        // covers the no-motion frame. Tucked, the lens paints nothing.
+        let mut lens_shape = resting(self.state);
         let island = if let Some(motion) = motion.filter(|motion| motion.generation == generation) {
             let (shape, raw) = frame_shape(&motion);
-            frost_shape = shape;
+            lens_shape = shape;
             if raw < 1.0 {
                 let ticket = generation;
                 cx.spawn(async move |view, cx| {
@@ -970,9 +970,9 @@ impl IslandView {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
                 view.on_arrow(event, cx);
             }))
-            // The frost paints first so the shell sits on top of it.
-            .child(glass::frost(
-                frost_shape,
+            // The lens paints first so the shell sits on top of it.
+            .child(glass::lens(
+                lens_shape,
                 self.state,
                 self.glass.as_ref(),
             ))

@@ -1,9 +1,9 @@
-//! The frosted-wallpaper backdrop the liquid-glass shell sits on.
+//! The wallpaper backdrop the liquid-glass shell bends.
 //!
 //! GPUI has no backdrop blur and the dock's window cannot sample what sits
-//! behind it, so the frost is built once from the wallpaper file itself: a
-//! crop of exactly the region the stage covers, blurred and saturated on the
-//! background executor, then painted one-to-one under the shell. The crop is
+//! behind it, so the backdrop is built once from the wallpaper file itself: a
+//! crisp crop of the stage plus a margin, saturated on the background
+//! executor, then warped under the shell by the glass view. The crop is
 //! rebuilt when the fingerprint moves — the wallpaper file (path, size,
 //! mtime) or the stage rect (the dock slides across monitors with different
 //! origins and DPI scales).
@@ -14,8 +14,7 @@
 //! Per-monitor wallpapers are not honored; [`SystemParametersInfoW`] reports
 //! the shared path and the dock lives on the primary display. Live video
 //! wallpapers (Wallpaper Engine) never change a file, so the glass keeps the
-//! last sampled frame — under [`BLUR_RADIUS`] pixels of blur that reads the
-//! same.
+//! last sampled frame at full sharpness.
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -26,18 +25,6 @@ use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, Reg
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETDESKWALLPAPER, SystemParametersInfoW,
 };
-
-/// Box-blur radius, physical pixels. Three passes of this approximate a
-/// Gaussian wide enough to read as frost, and wide enough that a stale frame
-/// of a video wallpaper is indistinguishable.
-pub const BLUR_RADIUS: usize = 9;
-
-/// Blur radius of the lens copy, physical pixels.
-///
-/// The rim bends the desktop, so it has to keep the structure it bends:
-/// painting the frosted face into the lens band would hide the displacement
-/// entirely. Two pixels of blur still reads as polished glass.
-pub const LENS_BLUR_RADIUS: usize = 2;
 
 /// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
 pub const SATURATION: f32 = 1.15;
@@ -88,18 +75,12 @@ impl WallpaperPosition {
 /// distance it can reach. Must exceed the lens pull in `island_view::glass`.
 pub const REFRACTION_MARGIN: f32 = 40.0;
 
-/// A frosted wallpaper crop ready to paint. Built on the background executor
-/// and swapped into the view as one value.
+/// A wallpaper crop ready to bend. Built on the background executor and
+/// swapped into the view as one value.
 #[derive(Clone)]
 pub struct GlassBackdrop {
-    /// The blurred crop, one-to-one with the stage plus a lens margin.
+    /// The crisp crop, one-to-one with the stage plus a lens margin.
     pub image: Arc<RenderImage>,
-    /// The same crop with only [`LENS_BLUR_RADIUS`], for the refracting rim.
-    ///
-    /// The rim has to keep the structure it displaces, so it cannot borrow
-    /// the frosted face; the two are the same geometry, so a ring can swap
-    /// between them without shifting.
-    pub lens: Arc<RenderImage>,
     /// Mean lightness of the crop, 0.0 dark .. 1.0 bright. Drives the scrim.
     pub luma: f32,
     /// Logical margin around the stage, `(left, top, right, bottom)`.
@@ -109,7 +90,7 @@ pub struct GlassBackdrop {
     pub pad: (f32, f32, f32, f32),
 }
 
-/// What makes the frosted crop stale: the wallpaper file AND the stage rect.
+/// What makes the crop stale: the wallpaper file AND the stage rect.
 ///
 /// The rect is the overlay window's physical rect — origin, width, height —
 /// in the resolution [`fingerprint_now`] was called with.
@@ -251,7 +232,7 @@ pub fn screen_size() -> (u32, u32) {
     }
 }
 
-/// Builds the frosted crop for one stage rect.
+/// Builds the wallpaper crop for one stage rect.
 ///
 /// Runs on the background executor only: a full decode plus resize costs
 /// hundreds of milliseconds. Any failure — unreadable file, undecodable
@@ -297,13 +278,8 @@ pub fn build(
     let cw = w as usize;
     let ch = h as usize;
     saturate(&mut crop_raw, SATURATION);
-    // The rim keeps a lightly blurred copy so the lens has structure to bend.
-    let mut lens_raw = crop_raw.clone();
-    blur3(&mut lens_raw, cw, ch, LENS_BLUR_RADIUS);
-    blur3(&mut crop_raw, cw, ch, BLUR_RADIUS);
     let luma = mean_luma(&crop_raw);
     let frame = frame_from_rgba(cw, ch, &crop_raw)?;
-    let lens_frame = frame_from_rgba(cw, ch, &lens_raw)?;
     // The lens works in logical pixels; the pad is physical pixels / scale.
     #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
     let pad = (
@@ -314,7 +290,6 @@ pub fn build(
     );
     Some(GlassBackdrop {
         image: Arc::new(RenderImage::new(smallvec::smallvec![frame])),
-        lens: Arc::new(RenderImage::new(smallvec::smallvec![lens_frame])),
         luma,
         pad,
     })
@@ -422,83 +397,6 @@ pub fn stage_crop(
     Some((x, y, width, height))
 }
 
-/// One box-blur pass over one axis. RGBA, alpha passed through.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "every index is provably in bounds: `base + m*step + c` spans \
-              exactly one row (horizontal: base scales the row, step 4) or one \
-              column (vertical: base the column, step `w*4`), because `line` \
-              runs over the OTHER axis and `m`/`head`/`tail` are clamped below \
-              `major`; the tests pin both passes end-to-end"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "accumulators stay small and well below f32's 24-bit mantissa, \
-              averages are 0..=255 before rounding off negative values"
-)]
-fn blur_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize, horizontal: bool) {
-    let (major, minor) = if horizontal { (w, h) } else { (h, w) };
-    let line_stride = w * 4;
-    let step = if horizontal { 4 } else { w * 4 };
-    for line in 0..minor {
-        // Sliding window per channel; RGB only, alpha copies through. A line
-        // is a row for horizontal passes and a column for vertical ones.
-        let base = if horizontal {
-            line * line_stride
-        } else {
-            line * 4
-        };
-        let mut sums = [0f32; 3];
-        let initial = radius.min(major - 1);
-        for off in 0..=initial {
-            for c in 0..3 {
-                sums[c] += f32::from(src[base + off * step + c]);
-            }
-        }
-        let mut count = (initial + 1) as f32;
-        for m in 0..major {
-            let center = base + m * step;
-            for c in 0..3 {
-                dst[center + c] = (sums[c] / count).round() as u8;
-            }
-            dst[center + 3] = src[center + 3];
-            // Window slides: add the incoming tail, drop the outgoing head.
-            if m + radius + 1 < major {
-                for c in 0..3 {
-                    sums[c] += f32::from(src[base + (m + radius + 1) * step + c]);
-                }
-                count += 1.0;
-            }
-            if m >= radius {
-                for c in 0..3 {
-                    sums[c] -= f32::from(src[base + (m - radius) * step + c]);
-                }
-                count -= 1.0;
-            }
-        }
-    }
-}
-
-/// Three box-blur passes, horizontal then vertical each, over an RGBA buffer.
-///
-/// Approaches a Gaussian far more cheaply than a float kernel. On a constant
-/// input every pass is the identity, so frost never invents color.
-pub fn blur3(buffer: &mut [u8], w: usize, h: usize, radius: usize) {
-    if w == 0 || h == 0 || radius == 0 {
-        return;
-    }
-    let mut scratch = vec![0u8; buffer.len()];
-    for _ in 0..3 {
-        blur_pass(buffer, &mut scratch, w, h, radius, true);
-        blur_pass(&scratch, buffer, w, h, radius, false);
-    }
-}
-
-/// Scales RGB saturation by `factor` around each pixel's luma, clamped.
-///
-/// 1.0 changes nothing; extremes clamp to their own channel range.
 /// Scales RGB saturation by `factor` around each pixel's luma, clamped.
 ///
 /// 1.0 changes nothing; extremes clamp to their own channel range.
@@ -695,31 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn box_blur_of_a_constant_image_is_the_same_constant() {
-        let mut buffer = gray(200, 8, 8);
-        blur3(&mut buffer, 8, 8, 2);
-        for chunk in buffer.chunks_exact(4) {
-            assert_eq!(&chunk[..3], &[200, 200, 200]);
-            assert_eq!(chunk[3], 255);
-        }
-    }
-
-    #[test]
-    fn box_blur_softens_a_hard_edge() {
-        let mut buffer = gray(0, 8, 8);
-        for y in 0..8 {
-            for x in 4..8 {
-                let at = (y * 8 + x) * 4;
-                buffer[at..at + 3].copy_from_slice(&[255, 255, 255]);
-            }
-        }
-        blur3(&mut buffer, 8, 8, 1);
-        // The straddling column must sit strictly between the two sides.
-        let at = 3 * 4;
-        assert!(buffer[at] > 0 && buffer[at] < 255);
-    }
-
-    #[test]
     fn mean_luma_matches_a_hand_computation() {
         // Two pixels: pure white and pure black → mean luma 0.5.
         let mut buffer = Vec::new();
@@ -809,12 +682,11 @@ mod tests {
     fn build_pipeline_holds_shape_on_a_constant_crop() {
         // `build` reaches the wallpaper only through the real SPI path, which
         // a unit test cannot point at a temp file. The pure pipeline pieces
-        // behind it get the same inputs here: constant gray must survive blur
-        // and saturation untouched, and the frame must carry the swap.
+        // behind it get the same inputs here: constant gray must survive
+        // saturation untouched, and the frame must carry the swap.
         let mut raw = gray(10, 42, 42);
-        blur3(&mut raw, 42, 42, 3);
         saturate(&mut raw, 1.15);
-        assert_eq!(raw[0], 10, "constant gray survives both passes");
+        assert_eq!(raw[0], 10, "constant gray survives the saturation pass");
         let frame = frame_from_rgba(42, 42, &raw).unwrap();
         assert_eq!(frame.buffer().width(), 42);
         assert_eq!(frame.buffer().height(), 42);
