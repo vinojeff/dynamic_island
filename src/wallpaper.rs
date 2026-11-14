@@ -15,6 +15,9 @@
 //! the shared path and the dock lives on the primary display. Live video
 //! wallpapers (Wallpaper Engine) never change a file, so the glass keeps the
 //! last sampled frame at full sharpness.
+//!
+//! This is the fallback path now: while live capture runs, the wallpaper is
+//! sampled at most once to seed the static slot.
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;

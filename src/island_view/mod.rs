@@ -10,7 +10,8 @@
 //! `view.update` fails and the loop ends:
 //!
 //! - 32ms: [`IslandView::poll_pointer`], [`IslandView::poll_tray`],
-//!   [`IslandView::poll_volume`], and the card-idle check. Drain only. No I/O.
+//!   [`IslandView::poll_volume`], [`IslandView::poll_live`], and the card-idle
+//!   check. Drain only except for the live capture start/stop spawns.
 //! - 1s: `media::current`, then `toasts::poll`. A seek drag drops the fresh
 //!   snapshot. Transport is started, not joined.
 //! - 1s, separate: one `perf::Sampler` moved onto the executor and back.
@@ -41,6 +42,7 @@ use gpui_kit::{
     Window, div, ease_out_quint,
 };
 
+use crate::live_glass;
 use crate::pointer::{PointerWatch, ScreenPoint};
 use crate::toasts;
 use crate::wallpaper;
@@ -183,6 +185,13 @@ pub struct IslandView {
     /// the epoch they captured so a stale one cannot overwrite a snapshot
     /// taken for a later rect.
     glass_epoch: u64,
+    /// Live capture state. It publishes through `glass` above.
+    live: live_glass::LiveGlass,
+    /// The last wallpaper crop, kept as the fallback while live capture runs.
+    static_glass: Option<std::sync::Arc<wallpaper::GlassBackdrop>>,
+    /// Previous tick's live ownership, so a transition to the static path
+    /// restores the fallback exactly once.
+    live_on: bool,
     /// Toasts waiting to preempt media. Empty means the media source.
     notices: Queue,
     /// Last SMTC snapshot. Idle until the first poll returns.
@@ -239,6 +248,9 @@ impl IslandView {
             glass_building: false,
             glass_fingerprint: None,
             glass_epoch: 0,
+            live: live_glass::LiveGlass::new(),
+            static_glass: None,
+            live_on: false,
             notices: Queue::new(),
             now_playing: NowPlaying::idle(),
             tray: None,
@@ -328,6 +340,7 @@ impl IslandView {
     /// only drains messages that have already arrived. The 1s loop is the one
     /// that calls SMTC and the notification center. Those calls block, so they
     /// run on `background_executor` and never occupy the UI thread.
+    #[allow(clippy::too_many_lines)]
     pub fn arm(&mut self, cx: &mut Context<Self>) {
         if self.pointer.is_none() {
             self.pointer = Some(PointerWatch::spawn());
@@ -335,6 +348,7 @@ impl IslandView {
         if self.endpoint.is_none() {
             self.endpoint = Some(Endpoint::spawn());
         }
+        self.arm_live(cx);
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(32)).await;
@@ -343,6 +357,9 @@ impl IslandView {
                         view.poll_pointer(cx);
                         view.poll_tray(cx);
                         view.poll_volume(cx);
+                        if view.poll_live(cx) {
+                            cx.notify();
+                        }
                         if view.state == IslandState::Capsule {
                             cx.notify();
                         }
@@ -453,37 +470,18 @@ impl IslandView {
     /// fingerprint carries, not the scale; across a DPI boundary the physical
     /// rect changes by itself.)
     fn poll_glass(&mut self, cx: &mut Context<Self>) {
+        // Live owns the glass. One static build is still allowed to seed the
+        // fallback slot; after that the wallpaper is not sampled at all.
+        if self.live.is_live() && self.static_glass.is_some() {
+            return;
+        }
         if self.glass_building {
             return;
         }
-        let placed = cx.windows().first().and_then(|handle| {
-            handle.update(cx, |_root, window, _cx| {
-                let scale = window.scale_factor().max(1.0);
-                (
-                    physical_origin_x(window),
-                    physical_origin_y(window),
-                    scale,
-                )
-            }).ok()
-        });
-        let Some((origin_x, origin_y, scale)) = placed else {
+        let Some((origin_x, origin_y, width, height, scale)) = placed_stage(cx) else {
             return;
         };
-        // The stage is exactly the window rect on screen.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the stage is at most a couple thousand logical pixels, and \
-                      physical size rounds down a sub-pixel edge harmless to a \
-                      blurred crop"
-        )]
-        let rect = (
-            origin_x,
-            origin_y,
-            (island::STAGE_WIDTH as f32 * scale) as u32,
-            (island::STAGE_HEIGHT as f32 * scale) as u32,
-        );
+        let rect = (origin_x, origin_y, width, height);
         let epoch = self.glass_epoch();
         cx.spawn(async move |view, cx| {
             let snapshot =
@@ -514,7 +512,11 @@ impl IslandView {
                 view.glass_building = false;
                 // Stored on failure too: None backdrop, recorded fingerprint.
                 view.glass_fingerprint = snapshot;
-                view.glass = built.map(std::sync::Arc::new);
+                let built = built.map(std::sync::Arc::new);
+                view.static_glass.clone_from(&built);
+                if !view.live.is_live() {
+                    view.glass = built;
+                }
                 cx.notify();
             })
             .ok();
@@ -527,6 +529,168 @@ impl IslandView {
     fn glass_epoch(&mut self) -> u64 {
         self.glass_epoch = self.glass_epoch.saturating_add(1);
         self.glass_epoch
+    }
+
+    /// Starts the live path according to `RUSTEDGE_GLASS`, or falls back.
+    fn arm_live(&mut self, cx: &mut Context<Self>) {
+        let mode = live_glass::mode_from_env(std::env::var("RUSTEDGE_GLASS").ok().as_deref());
+        let hwnd = cx
+            .windows()
+            .first()
+            .and_then(|handle| handle.update(cx, |_root, window, _cx| window_hwnd(window)).ok());
+        let Some(hwnd) = hwnd else {
+            return;
+        };
+        self.live.prepare(hwnd);
+        self.set_live_glass(matches!(mode, live_glass::Mode::Live), cx);
+        if self.live.is_live() {
+            let action = self.live.prewarm(millis_now());
+            self.apply_live(action, cx);
+        }
+    }
+
+    /// Enables or disables live capture. Disabling is also the future
+    /// "recording-visible" switch: no WDA, static wallpaper, no capture.
+    fn set_live_glass(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.live.set_enabled(on);
+        if self.live.is_live() {
+            // A wallpaper build that was already in flight when Live began
+            // must not install over a live frame. Bumping the epoch discards
+            // its completion; clearing the flag lets the fallback slot build
+            // once (the discard path never touches `glass_building`).
+            self.live_on = true;
+            self.glass_epoch = self.glass_epoch.saturating_add(1);
+            self.glass_building = false;
+            cx.notify();
+            return;
+        }
+        self.stop_live(cx);
+        self.live_on = false;
+        self.restore_static_glass();
+        cx.notify();
+    }
+
+    /// Puts the wallpaper crop back on screen and re-arms the static poll.
+    ///
+    /// Idempotent enough to run on any transition out of live ownership: the
+    /// installed crop is rebuilt once because the fingerprint is cleared.
+    fn restore_static_glass(&mut self) {
+        self.glass = self.static_glass.clone();
+        self.glass_fingerprint = None;
+        self.glass_epoch = self.glass_epoch.saturating_add(1);
+        self.glass_building = false;
+    }
+
+    /// Stops the session without waiting for it on the UI thread.
+    fn stop_live(&mut self, cx: &mut Context<Self>) {
+        let Some(control) = self.live.take_control() else {
+            return;
+        };
+        // `stop()` joins the capture thread; a join on the UI thread would
+        // freeze the island for the length of one frame.
+        cx.background_executor()
+            .spawn(async move {
+                let _ = control.stop();
+            })
+            .detach();
+    }
+
+    /// Runs one machine action. Starts and stops always hop off-thread.
+    fn apply_live(&mut self, action: live_glass::Action, cx: &mut Context<Self>) {
+        match action {
+            live_glass::Action::None => {}
+            live_glass::Action::Start => {
+                let request = self.live.start_request();
+                cx.spawn(async move |view, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { live_glass::start_session(&request) })
+                        .await;
+                    view.update(cx, |view, cx| {
+                        let now = millis_now();
+                        let action = view.live.start_done(result, now);
+                        view.apply_live(action, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            live_glass::Action::Stop => {
+                let Some(control) = self.live.take_control() else {
+                    return;
+                };
+                cx.spawn(async move |view, cx| {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let _ = control.stop();
+                        })
+                        .await;
+                    view.update(cx, |view, cx| {
+                        let action = view.live.stop_done(millis_now());
+                        view.apply_live(action, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Drains live capture: feed visibility, run actions, install the frame.
+    /// Returns true when the glass changed.
+    fn poll_live(&mut self, cx: &mut Context<Self>) -> bool {
+        let live = self.live.is_live();
+        if live != self.live_on {
+            self.live_on = live;
+            if !live {
+                self.restore_static_glass();
+                return true;
+            }
+        }
+        if !live {
+            return false;
+        }
+        let now = millis_now();
+        let wanted = self.state != IslandState::Line && !self.hidden && !self.exclusive;
+        // Always keep the crop current while live, even when collapsed: the
+        // prewarm session and the first expand both need a valid rect before
+        // `wanted` ever turns true. Unchanged specs are a cheap comparison.
+        if let Some((x, y, width, height, scale)) = placed_stage(cx) {
+            self.live.update_crop((x, y, width, height), scale);
+        }
+        let action = self.live.tick(wanted, now);
+        self.apply_live(action, cx);
+
+        if self.live.control_finished() {
+            let Some(control) = self.live.take_control() else {
+                return false;
+            };
+            cx.spawn(async move |view, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { control.stop() })
+                    .await;
+                let error = result.is_err();
+                view.update(cx, |view, cx| {
+                    let action = view.live.session_ended(error, millis_now());
+                    view.apply_live(action, cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+
+        let (frame, action) = self.live.take_frame(now);
+        self.apply_live(action, cx);
+        if let Some(frame) = frame {
+            self.glass = Some(frame);
+            true
+        } else {
+            false
+        }
     }
 
     fn poll_tray(&mut self, cx: &mut Context<Self>) {
@@ -1448,6 +1612,33 @@ fn cursor_x() -> Option<i32> {
     let mut point = windows_sys::Win32::Foundation::POINT::default();
     let found = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut point) };
     if found == 0 { None } else { Some(point.x) }
+}
+
+/// The stage in physical pixels, plus the DPI scale, captured on the UI thread.
+fn placed_stage(cx: &mut Context<IslandView>) -> Option<(i32, i32, u32, u32, f32)> {
+    cx.windows().first().and_then(|handle| {
+        handle
+            .update(cx, |_root, window, _cx| {
+                let scale = window.scale_factor().max(1.0);
+                // The stage is exactly the window rect on screen.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "the stage is at most a couple thousand logical pixels, and \
+                              physical size rounds down a sub-pixel edge harmless to a \
+                              blurred crop"
+                )]
+                (
+                    physical_origin_x(window),
+                    physical_origin_y(window),
+                    (island::STAGE_WIDTH as f32 * scale) as u32,
+                    (island::STAGE_HEIGHT as f32 * scale) as u32,
+                    scale,
+                )
+            })
+            .ok()
+    })
 }
 
 fn physical_origin_x(window: &Window) -> i32 {

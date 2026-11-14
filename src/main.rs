@@ -14,7 +14,7 @@
 //!    `WS_EX_TOOLWINDOW` so the shell does not grow a taskbar button. One
 //!    `SetWindowPos(HWND_TOPMOST)` runs here. Later raises belong to the tray.
 //! 4. The deferred init calls [`IslandView::arm`] and [`IslandView::take_tray`].
-//!    Arm starts the hook, the volume STA, and the three poll loops.
+//!    Arm starts the hook, the volume STA, live glass, and the poll loops.
 //! 5. Once the window is on screen, [`show_without_taskbar`] hides and shows
 //!    with `SW_SHOWNOACTIVATE`. A `Normal` window that has already been shown
 //!    keeps its taskbar button unless it is hidden once after
