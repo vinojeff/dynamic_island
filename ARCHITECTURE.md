@@ -5,6 +5,10 @@ tucked line, a hover capsule, and an expanded card. Geometry and policy live in
 a library so they can be tested without opening a window. The GPUI binary owns
 the window, the threads, and every side effect.
 
+The liquid glass under the shell samples the desktop live through Windows
+Graphics Capture: windows, video, and games bend under it as they move. The
+wallpaper crop remains as the fallback and as the recording-visible mode.
+
 Read this top to bottom and you are walking the same path the process walks:
 startup, the three loops, a pointer sample becoming a shape, a toast becoming
 the head, then paint.
@@ -18,10 +22,11 @@ same arrangement as `SendMessage` back to a window thread).
 
 ```
 hook thread --ScreenPoint-->  GPUI thread (IslandView)  --VolumeCommand--> volume STA
-tray thread --Command------>       |                          |
-       ^                            |-- media::send / seek --> background executor
-       |                            |-- media::current, toasts::poll (1s)
-       |                            |-- perf::Sampler::sample (1s, its own loop)
+tray thread --Command------>       |  <----CropSpec---- WGC thread
+       ^                           |  ---GlassBackdrop--> WGC thread
+       |                           |-- media::send / seek --> background executor
+       |                           |-- media::current, toasts::poll (1s)
+       |                           |-- perf::Sampler::sample (1s, its own loop)
        +------ DOCK_HWND (atomic) --+
 ```
 
@@ -31,7 +36,12 @@ tray thread --Command------>       |                          |
 | Mouse hook | `PeekMessage` + 30ms sleep | `WH_MOUSE_LL` | `ScreenPoint` over `mpsc` |
 | Tray | `GetMessage` | notify icon, foreground hook, 2s topmost timer | `Command` over `mpsc` |
 | Volume STA | blocking `recv` | `IAudioEndpointVolume`, COM apartment | `Reading` over `mpsc` |
+| WGC capture | `windows-capture` session loop | D3D11 device, frame pool, one monitor item | `Arc<GlassBackdrop>` through the `Sink` slot |
 | Background executor | GPUI pool | one-shot `WinRT` and `sysinfo` calls | results through `view.update` |
+
+The capture thread exists only while an island session is open. `start_session`
+creates it (the call blocks until WinRT and D3D are up) and `Control::stop`
+joins it, so both run on the background executor: neither may block the UI.
 
 The volume interface is created on the STA thread and is not `Send`. The
 compiler rejects moving it. The tray thread initializes its own apartment and
@@ -53,6 +63,7 @@ notice. Callers match before use.
 | `src/perf.rs` | lib | CPU, memory, and network samples. One `System` for the process. |
 | `src/media.rs` | lib | SMTC snapshot, seek, transport, cover cache. |
 | `src/main.rs` | bin | Window, DWM frame, taskbar hiding, tray thread. |
+| `src/live_glass.rs` | bin | Live capture: crop math, downsampling, luma smoothing, session machine, WGC handler, WDA. |
 | `src/island_view/mod.rs` | bin | The view. Subscribes to every channel, owns the loops, paints. |
 | `src/island_view/chrome.rs` | bin | Shell paint: capsule row, card body, notice page, volume overlay. |
 | `src/island_view/media_page.rs` | bin | Media half of the card: cover, seek, sessions, transport. |
@@ -76,6 +87,8 @@ close over the view.
 | `SEEK_REFUSED` | background seek | GPUI | `AtomicBool`. A plain `bool` would be a data race. |
 | `CoverCache` | poll threads | poll threads | `OnceLock<Mutex<_>>`. Init once, then the mutex. |
 | `PerfSample` | background executor | GPUI | one `Copy` value. The `Sampler` itself moves with the task and comes back. |
+| `CropSpec` | GPUI | WGC capture | `Arc<Mutex<_>>` shared with the handler, which copies it once per frame. |
+| `GlassBackdrop` | WGC capture | GPUI | `Arc` left in the `Sink` mutex slot; the view takes at most one per tick. |
 
 The hook procedure and the tray window procedure are function pointers, so
 neither can carry a context argument. The hook keeps its `Sender` in a thread
@@ -95,9 +108,14 @@ cleared before the `Tray` drops.
    `WS_EX_TOOLWINDOW` so the shell does not grow a taskbar button. One
    `SetWindowPos(HWND_TOPMOST)` runs here. Later raises belong to the tray.
 4. The deferred init on the new view calls `IslandView::arm` and
-   `take_tray`. Arm starts the hook thread, the volume STA, and the three
-   detached loops below.
-5. Once the window is on screen, `show_without_taskbar` hides and shows with
+   `take_tray`. Arm starts the hook thread, the volume STA, resolves
+   `RUSTEDGE_GLASS` (live unless it says `static`), and starts the three
+   detached loops below. The window handle is not registered yet, so live
+   capture waits.
+5. The first 32ms tick sees a window handle. `try_arm_live` sets
+   `WDA_EXCLUDEFROMCAPTURE` on it and starts one prewarm session. A failed
+   `SetWindowDisplayAffinity` pins the static wallpaper for this launch.
+6. Once the window is on screen, `show_without_taskbar` hides and shows with
    `SW_SHOWNOACTIVATE`. A `Normal` window that has already been shown keeps
    its taskbar button unless it is hidden once after `WS_EX_APPWINDOW` is
    cleared. `tray::watch_layer` release-stores the hwnd.
@@ -118,8 +136,9 @@ inside `view.update`.
 
 ### 32ms drain
 
-`poll_pointer`, `poll_tray`, `poll_volume`, then the card-idle check. This
-loop never calls out.
+`poll_pointer`, `poll_tray`, `poll_volume`, `poll_live`, then the card-idle
+check. Nothing here blocks: a capture start or stop hops to the background
+executor and reports back through `view.update`.
 
 `poll_pointer` drains every `ScreenPoint` queued since the last tick. A
 release finishes the seek. The last point is converted from screen pixels to
@@ -133,6 +152,10 @@ window-local logical pixels (`(physical - origin) / scale`) and handed to
 
 `poll_volume` keeps the newest `Reading`. The overlay timestamp is cleared
 `OVERLAY_HOLD` (1500ms) after the last accepted step.
+
+`poll_live` describes the stage to the capture machine, runs the returned
+action, and installs at most one new frame. It reports a change only when a
+frame replaced the glass, so a static desktop does not repaint.
 
 While the state is `Capsule`, the tick calls `cx.notify` so the marquee and
 the volume overlay keep moving between the 1s polls.
@@ -157,6 +180,69 @@ the sampler onto the executor, calls `sample`, and moves it back, so the
 the four series at 60. `cx.notify` runs only when `tab == Perf` and the state
 is not `Line`. A hidden chart does not repaint the media page. Changing pages
 does not clear the history.
+
+## Live glass
+
+The lens bends whatever sits behind the stage. The wallpaper crop cannot do
+that when a window, a video, or a game covers the desktop, so `live_glass`
+samples the composited desktop with Windows Graphics Capture and feeds the
+lens a fresh crop.
+
+**Exclusion.** The overlay sets `WDA_EXCLUDEFROMCAPTURE` on its own window
+before the first session starts. The capture therefore never sees the glass
+(it would feed back into itself), and display capture tools do not see the
+island either. If the call fails, the launch stays on the wallpaper.
+
+**Mode.** Live is the default. `RUSTEDGE_GLASS=static` (trimmed,
+case-insensitive) forces the wallpaper for a launch. `set_live_glass(false)`
+is already the switch a future "visible while recording" option needs: it
+clears the WDA bit, stops capture, and puts the wallpaper crop back.
+
+**Crop.** `crop_spec` clips the physical stage to the primary monitor, adds
+`REFRACTION_MARGIN` logical pixels of lens margin on each side, and picks an
+integer downsampling factor from the DPI scale (`round(scale)`, clamped to
+1..=3). Right and bottom are rounded down to whole blocks so `downsample` has
+no leftovers. `pad` records the logical margin the lens already expects. The
+view updates the spec on every tick while live, even collapsed: the prewarm
+session and the first expand both need a valid rect, and an unchanged spec is
+one comparison.
+
+**Session.** `Machine` is a pure event machine (`Off`, `Idle`, `Starting`,
+`Running`, `Stopping`) that returns `Start` or `Stop`; the view runs those on
+the background executor. `poll_live` feeds it
+`SetWanted(state != Line && !hidden && !exclusive)` and `RetryDue` when the
+backoff elapsed. A stop is requested from `Running` only; a visibility change
+during `Starting`/`Stopping` is recorded and resolved when the transition
+lands.
+
+**Prewarm.** Arming starts one session while the island is still a line. It
+caches a frame so the first hover shows live pixels immediately; the frame or
+a 2s deadline stops it. Expanding during the prewarm cancels the
+stop-after-frame behavior, and the repeated `wanted == false` feed cannot
+tear the session down before the cache is filled.
+
+**Frame path.** The handler reads the shared spec, crops the D3D staging
+buffer with `buffer_crop`, box-averages it by the factor, applies the same
+saturation as the wallpaper path, measures mean luma, builds a `RenderImage`,
+and publishes a `GlassBackdrop` into `Sink`. The view takes the newest frame
+only while `Running`, smooths luma with a 200ms time constant, installs it in
+`glass`, and repaints. A frame that lands while `Stopping` is dropped.
+
+**Idle cost.** Windows Graphics Capture delivers a frame only when the
+desktop changed, and `MinimumUpdateIntervalSettings::Custom(33ms)` caps the
+rate near 30fps. A static desktop produces no frames, a collapsed island
+tears the session down, and no frames means no repaint.
+
+**Failure budget.** `Unsupported` and `Border` faults fall back for the launch
+immediately; cursor and minimum-interval settings degrade one at a time and
+retry. Other start errors and `FrameHandlerError` count; three consecutive
+faults set the machine `Off` and restore the wallpaper. Backoff is 1s, 2s,
+then 4s. A delivered frame resets the count, and a clean session end (lock
+screen, display change) retries after 1s without counting.
+
+**Fallback slots.** `static_glass` keeps the last wallpaper crop. While live,
+a wallpaper build only refreshes that slot, so a slow decode cannot overwrite
+a live frame; leaving live installs the slot back.
 
 ## One pointer sample
 
@@ -346,6 +432,11 @@ takes focus, and it is never bounced through `HWND_NOTOPMOST`.
 snapshot: shape, tab, the notice head (suppressed while exclusive), the
 seek-adjusted progress, `seekable` after `seek_refused`, and the perf history.
 The render path does not re-borrow the view.
+
+`glass` is the lens backdrop: the newest live frame while the capture is
+`Running`, otherwise the latest wallpaper crop. Both arrive as the same
+`GlassBackdrop` (`image`, `luma`, `pad`), so the lens never branches on the
+source.
 
 `paint_motion` builds the listeners, then `chrome::paint`:
 

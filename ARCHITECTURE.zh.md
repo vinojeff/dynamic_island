@@ -2,6 +2,8 @@
 
 Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大小的窗口在三条形态之间变形：收起的细线、悬停胶囊、展开的卡片。几何和策略放在库里，不打开窗口也能测。GPUI 二进制拥有窗口、全部线程和每一种副作用。
 
+外壳下面的液态玻璃通过 Windows Graphics Capture 实时采样桌面：窗口、视频、游戏在它后面移动时都会被折射。壁纸切片仍然保留，作为回退和「录屏可见」模式。
+
 从上往下读就是进程实际走的路：启动，三条循环，一次指针采样变成形态，一条通知变成队头，然后绘制。
 
 ## 线程
@@ -10,8 +12,9 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 
 ```
 钩子线程 --ScreenPoint-->  GPUI 线程 (IslandView)  --VolumeCommand--> 音量 STA
-托盘线程 --Command------>       |                          |
-       ^                         |-- media::send / seek --> 后台 executor
+托盘线程 --Command------>       |  <----CropSpec---- WGC 线程
+       ^                         |  ---GlassBackdrop--> WGC 线程
+       |                         |-- media::send / seek --> 后台 executor
        |                         |-- media::current, toasts::poll（1 秒）
        |                         |-- perf::Sampler::sample（1 秒，自己的循环）
        +------ DOCK_HWND（原子量）--+
@@ -23,7 +26,10 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 | 鼠标钩子 | `PeekMessage` 加 30ms 睡眠 | `WH_MOUSE_LL` | `mpsc` 上的 `ScreenPoint` |
 | 托盘 | `GetMessage` | 通知图标、前台钩子、2 秒置顶定时器 | `mpsc` 上的 `Command` |
 | 音量 STA | 阻塞 `recv` | `IAudioEndpointVolume`、COM 公寓 | `mpsc` 上的 `Reading` |
+| WGC 捕获 | `windows-capture` 会话循环 | D3D11 设备、帧池、一个显示器采集项 | 经 `Sink` 槽交给 GPUI 的 `Arc<GlassBackdrop>` |
 | 后台 executor | GPUI 线程池 | 一次性的 `WinRT` 和 `sysinfo` 调用 | 结果经 `view.update` 回来 |
+
+捕获线程只在岛的会话打开期间存在。`start_session` 创建它（调用会阻塞到 WinRT 和 D3D 就绪），`Control::stop` join 它，所以两者都跑在后台 executor 上：谁都不能卡住 UI。
 
 音量接口在 STA 线程上创建，不是 `Send`。编译器拒绝把它挪走。托盘线程初始化自己的公寓，从不碰那个指针。`Sampler` 也不共享：性能循环把它移进 executor 做一次 `sample`，再移回来。每次新建 `System` 会让 CPU 停在 0，因为占用率是相对上一次刷新的差值。
 
@@ -40,6 +46,7 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 | `src/perf.rs` | lib | CPU、内存、网络采样。整个进程共用一个 `System`。 |
 | `src/media.rs` | lib | SMTC 快照、拖动定位、传输控制、封面缓存。 |
 | `src/main.rs` | bin | 窗口、DWM 边框、隐藏任务栏按钮、托盘线程。 |
+| `src/live_glass.rs` | bin | 实时捕获：裁剪计算、降采样、亮度平滑、会话状态机、WGC 处理器、WDA。 |
 | `src/island_view/mod.rs` | bin | 视图。订阅每条通道，拥有循环，负责绘制。 |
 | `src/island_view/chrome.rs` | bin | 外壳绘制：胶囊行、卡片体、通知页、音量叠加层。 |
 | `src/island_view/media_page.rs` | bin | 卡片的媒体半边：封面、进度、会话、传输。 |
@@ -60,6 +67,8 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 | `SEEK_REFUSED` | 后台 seek | GPUI | `AtomicBool`。普通 `bool` 跨线程是数据竞争。 |
 | `CoverCache` | 轮询线程 | 轮询线程 | `OnceLock<Mutex<_>>`。初始化一次，之后靠这把锁。 |
 | `PerfSample` | 后台 executor | GPUI | 一个 `Copy` 值。`Sampler` 本身跟着任务走，再回来。 |
+| `CropSpec` | GPUI | WGC 捕获 | `Arc<Mutex<_>>` 与处理器共享，处理器每帧拷一次。 |
+| `GlassBackdrop` | WGC 捕获 | GPUI | `Arc` 放在 `Sink` 的互斥槽里；视图每拍最多取一帧。 |
 
 钩子过程和托盘窗口过程都是函数指针，带不了上下文参数。钩子把 `Sender` 放在 thread local。托盘把 `Sender` 放进 `OnceLock`（写一次，之后读取不加锁），再把栈上 `Tray` 的裸指针放进 thread local。这个指针在 `Tray` drop 之前清掉。
 
@@ -68,8 +77,9 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 1. `tray::spawn` 启动托盘线程，并阻塞到图标创建完成。这样快速退出不会和这条线程赛跑。`Receiver<Command>` 回到 `main`。
 2. `open_island` 向 `stage_frame` 要一块 420 乘 360 的舞台，在主显示器上水平居中，顶边贴着屏幕（`STAGE_TOP` 是 0）。显示器尺寸为零就退出进程。
 3. `gpui_kit::open_window` 建一个无边框、不激活、背景透明的窗口。`hide_system_border` 去掉 DWM 边框并设置 `WS_EX_TOOLWINDOW`，shell 就不会长出任务栏按钮。这里调用一次 `SetWindowPos(HWND_TOPMOST)`。之后的再次置顶归托盘。
-4. 新视图上的延迟初始化调用 `IslandView::arm` 和 `take_tray`。arm 启动钩子线程、音量 STA，以及下面三条 detach 的循环。
-5. 窗口已经在屏幕上之后，`show_without_taskbar` 先隐藏，再用 `SW_SHOWNOACTIVATE` 显示。一个已经显示过的 `Normal` 窗口会保住任务栏按钮，除非在清掉 `WS_EX_APPWINDOW` 之后再隐藏一次。`tray::watch_layer` 用 release 语义写下 hwnd。
+4. 新视图上的延迟初始化调用 `IslandView::arm` 和 `take_tray`。arm 启动钩子线程、音量 STA，解析 `RUSTEDGE_GLASS`（除非写着 `static`，否则走实时），以及下面三条 detach 的循环。此时窗口句柄还没登记，所以实时捕获先等着。
+5. 第一次 32ms 拍看到窗口句柄。`try_arm_live` 在它上面设置 `WDA_EXCLUDEFROMCAPTURE`，并启动一个预热会话。`SetWindowDisplayAffinity` 失败会让这次启动钉死用静态壁纸。
+6. 窗口已经在屏幕上之后，`show_without_taskbar` 先隐藏，再用 `SW_SHOWNOACTIVATE` 显示。一个已经显示过的 `Normal` 窗口会保住任务栏按钮，除非在清掉 `WS_EX_APPWINDOW` 之后再隐藏一次。`tray::watch_layer` 用 release 语义写下 hwnd。
 
 退出就是 drop 的顺序。`Endpoint` 先丢掉命令发送端，STA 的 `recv` 得到断开，然后再 join。先 join 会死锁：那条线程正堵在 `recv` 里。`PointerWatch` 写下 `HOOK_STOP` 再 join。这里不能用 `PostThreadMessage(WM_QUIT)`，因为那条线程用 peek，退出消息会被丢掉。托盘的 `Drop` 去掉图标、事件钩子、定时器和消息窗口。三条循环没有 `JoinHandle`。视图没了之后 `view.update` 失败，循环在下一拍自己结束。
 
@@ -79,13 +89,15 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 
 ### 32ms 排空
 
-依次是 `poll_pointer`、`poll_tray`、`poll_volume`，然后是卡片空闲检查。这个循环不向外调用。
+依次是 `poll_pointer`、`poll_tray`、`poll_volume`、`poll_live`，然后是卡片空闲检查。这里没有阻塞调用：捕获的启停都跳到后台 executor，再经 `view.update` 回报。
 
 `poll_pointer` 排空上一拍之后排队的全部 `ScreenPoint`。有释放就结束进度拖动。最后一个点从屏幕像素换成窗口局部的逻辑像素（`(物理坐标 - 原点) / scale`），交给 `hover_at`。进度拖动进行中时，同一个 x 只改局部比例。`over_card` 喂给 `watch_card`。不在细线上时 `set_click_through` 设置 `WS_EX_TRANSPARENT`；进入热区就清掉。然后是 `apply_hover`。
 
 `poll_tray` 匹配 `Toggle`（独占隐藏期间忽略）、`Quit`、`ExclusiveHide`、`ExclusiveShow`。
 
 `poll_volume` 留下最新的一条 `Reading`。最后一次被接受的步进过了 `OVERLAY_HOLD`（1500ms），叠加层时间戳清掉。
+
+`poll_live` 把舞台描述给捕获状态机，执行返回的动作，最多安装一帧新画面。只有画面真的替换了玻璃才报告变化，所以静态桌面不会重绘。
 
 状态是胶囊时，这一拍会 `cx.notify`，跑马灯和音量叠加层在两次 1 秒轮询之间也能动。
 
@@ -98,6 +110,28 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 ### 1 秒的性能
 
 这是另一条任务。`Sampler::warm` 在 executor 上跑一次。每一拍把 sampler 移进 executor，调用 `sample`，再移回来。`System` 既不共享，也不重建。`PerfHistory::push` 把四条序列都封在 60 个点。只有 `tab == Perf` 且状态不是细线时才 `cx.notify`。藏着的图表不会重绘媒体页。换页不清历史。
+
+## 实时玻璃
+
+透镜折射的是舞台后面的东西。当窗口、视频或游戏盖住桌面时，壁纸切片做不到这一点，所以 `live_glass` 用 Windows Graphics Capture 采样合成后的桌面，把新的裁剪喂给透镜。
+
+**排除。** 悬浮层在第一个会话启动前就对自己的窗口设置 `WDA_EXCLUDEFROMCAPTURE`。这样捕获永远看不到玻璃本身（否则会自我反馈），屏幕录制工具也看不到岛。如果这个调用失败，本次启动留在壁纸模式。
+
+**模式。** 默认实时。`RUSTEDGE_GLASS=static`（去掉空白、忽略大小写）让本次启动强制用壁纸。`set_live_glass(false)` 就是未来「录屏时可见」选项要用的开关：它清掉 WDA 位、停止捕获，并把壁纸切片放回去。
+
+**裁剪。** `crop_spec` 把物理舞台裁到主显示器内，四边加上 `REFRACTION_MARGIN` 逻辑像素的透镜余量，再按 DPI 缩放选一个整数降采样因子（`round(scale)`，夹在 1..=3）。右边和下边向下取整到整块，`downsample` 才不会剩零头。`pad` 记下透镜本来就预期的逻辑余量。实时期间视图每一拍都更新这份描述，哪怕岛是收起的：预热会话和第一次展开都需要有效矩形，而描述没变时只是一次比较。
+
+**会话。** `Machine` 是纯事件状态机（`Off`、`Idle`、`Starting`、`Running`、`Stopping`），只返回 `Start` 或 `Stop`；视图把这两个动作放到后台 executor 上跑。`poll_live` 每拍喂它 `SetWanted(state != Line && !hidden && !exclusive)`，退避到期时再喂 `RetryDue`。只有 `Running` 才会请求停止；`Starting`/`Stopping` 期间的可视性变化先记下，等这次转换落地再处理。
+
+**预热。** arm 时岛还是细线，就先起一个会话。它缓存一帧，让第一次悬停立刻显示实时像素；拿到帧或 2 秒到期就停。预热期间展开会取消「拿到一帧就停」的行为，反复喂进来的 `wanted == false` 也不能在缓存填好之前把会话拆掉。
+
+**帧路径。** 处理器读取共享的裁剪描述，用 `buffer_crop` 从 D3D staging 缓冲里裁出区域，按因子做盒式平均，套用和壁纸路径相同的饱和度，测出平均亮度，构造 `RenderImage`，再把 `GlassBackdrop` 发布到 `Sink`。视图只在 `Running` 时取最新一帧，用 200ms 时间常数平滑亮度，装进 `glass` 并重绘。`Stopping` 期间落地的帧直接丢掉。
+
+**空闲开销。** Windows Graphics Capture 只在桌面变化时交付帧，`MinimumUpdateIntervalSettings::Custom(33ms)` 把速率压到约 30fps。静态桌面不产帧，收起的岛会拆掉会话，没有帧就不会重绘。
+
+**失败预算。** `Unsupported` 和 `Border` 故障让本次启动立即回退；光标和最小间隔设置则逐级降级重试。其他启动错误和 `FrameHandlerError` 会计数；连续三次故障把状态机置为 `Off` 并恢复壁纸。退避是 1 秒、2 秒、4 秒。交付一帧会清零计数，干净地结束会话（锁屏、显示变化）只等 1 秒重试、不计数。
+
+**回退槽。** `static_glass` 保存最近一次壁纸切片。实时期间，壁纸构建只刷新这个槽，所以慢解码不会盖掉实时帧；离开实时时再把槽装回去。
 
 ## 一次指针采样
 
@@ -202,6 +236,8 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 ## 绘制
 
 `Render::render` 先造一个 `Face`，再调用 `paint_motion`。`face` 是快照：形状、当前页、通知队头（独占隐藏时压掉）、按拖动修正过的进度、经过 `seek_refused` 之后的 `seekable`，以及性能历史。绘制路径不再回头借用视图。
+
+`glass` 是透镜的底图：捕获处于 `Running` 时是最新实时帧，否则是最近一次壁纸切片。两者都以同样的 `GlassBackdrop`（`image`、`luma`、`pad`）出现，透镜的计算不区分来源。
 
 `paint_motion` 把监听器装好，然后进入 `chrome::paint`：
 
