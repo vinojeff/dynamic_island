@@ -343,6 +343,7 @@ impl Machine {
         self.prewarm_deadline = None;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle(&mut self, event: Event, now_ms: u64) -> Action {
         match event {
             Event::SetWanted(on) => {
@@ -412,6 +413,7 @@ impl Machine {
                 self.failures = self.failures.saturating_add(1);
                 self.phase = Phase::Idle;
                 if self.failures >= MAX_FAILURES {
+                    eprintln!("live glass: capture failed {MAX_FAILURES} times, falling back");
                     self.force_off();
                     return Action::None;
                 }
@@ -442,6 +444,9 @@ impl Machine {
                 if error {
                     self.failures = self.failures.saturating_add(1);
                     if self.failures >= MAX_FAILURES {
+                        eprintln!(
+                            "live glass: capture failed {MAX_FAILURES} times, falling back"
+                        );
                         self.force_off();
                         return Action::None;
                     }
@@ -600,10 +605,10 @@ pub(crate) struct StartRequest {
 }
 
 fn classify_start_error<E>(error: &GraphicsCaptureApiError<E>) -> StartFault {
+    use windows_capture::graphics_capture_api::Error as CaptureError;
     let GraphicsCaptureApiError::GraphicsCaptureApiError(error) = error else {
         return StartFault::Other;
     };
-    use windows_capture::graphics_capture_api::Error as CaptureError;
     match error {
         CaptureError::CursorConfigUnsupported => StartFault::Cursor,
         CaptureError::BorderConfigUnsupported => StartFault::Border,
@@ -640,7 +645,7 @@ fn start_with(
 ///
 /// `start_free_threaded` blocks until WinRT/D3D are up, so the caller runs this
 /// on the background executor.
-pub(crate) fn start_session(request: StartRequest) -> Result<Control, StartFault> {
+pub(crate) fn start_session(request: &StartRequest) -> Result<Control, StartFault> {
     if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
         return Err(StartFault::Unsupported);
     }
@@ -648,7 +653,7 @@ pub(crate) fn start_session(request: StartRequest) -> Result<Control, StartFault
     let mut interval =
         MinimumUpdateIntervalSettings::Custom(Duration::from_millis(CAPTURE_INTERVAL_MS));
     for _ in 0..4 {
-        match start_with(cursor, interval, &request) {
+        match start_with(cursor, interval, request) {
             Ok(control) => return Ok(control),
             Err(StartFault::Cursor) => cursor = CursorCaptureSettings::Default,
             Err(StartFault::Interval) => interval = MinimumUpdateIntervalSettings::Default,
@@ -779,7 +784,10 @@ impl LiveGlass {
     }
 
     pub(crate) fn control_finished(&self) -> bool {
-        self.control.as_ref().is_some_and(|control| control.is_finished())
+        match &self.control {
+            Some(control) => control.is_finished(),
+            None => false,
+        }
     }
 
     pub(crate) fn take_control(&mut self) -> Option<Control> {
@@ -824,6 +832,7 @@ impl LiveGlass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_capture::graphics_capture_api::Error as CaptureError;
 
     #[test]
     fn env_static_is_case_and_space_insensitive() {
@@ -1032,8 +1041,6 @@ mod tests {
 
     #[test]
     fn start_errors_degrade_by_kind() {
-        use windows_capture::graphics_capture_api::Error as CaptureError;
-
         let wrap = |error| GraphicsCaptureApiError::<()>::GraphicsCaptureApiError(error);
         assert_eq!(
             classify_start_error(&wrap(CaptureError::CursorConfigUnsupported)),
