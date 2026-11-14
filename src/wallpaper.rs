@@ -279,7 +279,7 @@ pub fn build(
     let ch = h as usize;
     saturate(&mut crop_raw, SATURATION);
     let luma = mean_luma(&crop_raw);
-    let frame = frame_from_rgba(cw, ch, &crop_raw)?;
+    let image = render_image_rgba(cw, ch, &crop_raw)?;
     // The lens works in logical pixels; the pad is physical pixels / scale.
     #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
     let pad = (
@@ -289,7 +289,7 @@ pub fn build(
         (bottom - (sy + sh)) as f32 / scale,
     );
     Some(GlassBackdrop {
-        image: Arc::new(RenderImage::new(smallvec::smallvec![frame])),
+        image: Arc::new(image),
         luma,
         pad,
     })
@@ -466,6 +466,16 @@ fn frame_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<image::Fr
     let buffer =
         image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, bgra)?;
     Some(image::Frame::new(buffer))
+}
+
+/// RGBA bytes to the opaque [`RenderImage`] the glass lens paints.
+///
+/// One construction shared by the wallpaper crop and live capture frames, so
+/// channel order stays identical app-wide.
+#[must_use]
+pub(crate) fn render_image_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<RenderImage> {
+    let frame = frame_from_rgba(width, height, rgba)?;
+    Some(RenderImage::new(smallvec::smallvec![frame]))
 }
 
 #[allow(clippy::unwrap_used)]
@@ -699,5 +709,12 @@ mod tests {
         let pixel = frame.buffer().get_pixel(0, 0).0;
         assert_eq!(pixel[0], 7, "first slot is B after the swap");
         assert_eq!(pixel[2], 9, "third slot is R after the swap");
+    }
+
+    #[test]
+    fn render_image_rejects_an_empty_frame() {
+        assert!(render_image_rgba(0, 1, &[]).is_none());
+        assert!(render_image_rgba(1, 0, &[]).is_none());
+        assert!(render_image_rgba(1, 1, &[1, 2, 3, 4]).is_some());
     }
 }

@@ -5491,6 +5491,7 @@ dependencies = [
  "smallvec",
  "sysinfo 0.37.2",
  "windows 0.62.2",
+ "windows-capture",
  "windows-core 0.62.2",
  "windows-implement 0.60.2",
  "windows-sys 0.61.2",
