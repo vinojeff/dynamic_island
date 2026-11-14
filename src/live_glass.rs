@@ -370,6 +370,12 @@ impl Machine {
                     Phase::Running => {
                         if on {
                             Action::None
+                        } else if self.prewarm {
+                            // The prewarm session is warming the cache while the
+                            // island is collapsed; the view feeds `wanted ==
+                            // false` on every tick. Only the first frame (or the
+                            // deadline) ends this session.
+                            Action::None
                         } else {
                             self.phase = Phase::Stopping;
                             self.after = Some(false);
@@ -1024,6 +1030,22 @@ mod tests {
         let mut machine = Machine::new();
         running(&mut machine);
         assert_eq!(machine.handle(Event::SetWanted(false), 0), Action::Stop);
+    }
+
+    #[test]
+    fn collapse_feed_does_not_stop_the_warm_session() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.handle(Event::Prewarm, 0), Action::Start);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::None);
+        // Collapsed, the view feeds `wanted == false` on every 32ms tick. That
+        // must not tear down the session before it has cached its first frame,
+        // or the machine would start and stop forever.
+        for tick in 0..5 {
+            assert_eq!(machine.handle(Event::SetWanted(false), 10 + tick), Action::None);
+        }
+        assert_eq!(machine.handle(Event::Frame, 40), Action::Stop);
+        assert_eq!(machine.handle(Event::StopDone, 50), Action::None);
+        assert_eq!(machine.phase(), Phase::Idle);
     }
 
     #[test]
