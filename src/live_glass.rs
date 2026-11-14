@@ -779,7 +779,10 @@ impl LiveGlass {
                 self.control = Some(control);
                 self.machine.handle(Event::StartOk, now_ms)
             }
-            Err(fault) => self.machine.handle(Event::StartErr(fault), now_ms),
+            Err(fault) => {
+                eprintln!("live glass: capture start failed ({fault:?})");
+                self.machine.handle(Event::StartErr(fault), now_ms)
+            }
         }
     }
 

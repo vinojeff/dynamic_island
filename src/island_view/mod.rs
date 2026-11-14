@@ -192,6 +192,10 @@ pub struct IslandView {
     /// Previous tick's live ownership, so a transition to the static path
     /// restores the fallback exactly once.
     live_on: bool,
+    /// `RUSTEDGE_GLASS` for this launch, resolved once in `arm`.
+    live_env: live_glass::Mode,
+    /// The window handle existed long enough to set capture affinity.
+    live_armed: bool,
     /// Toasts waiting to preempt media. Empty means the media source.
     notices: Queue,
     /// Last SMTC snapshot. Idle until the first poll returns.
@@ -251,6 +255,8 @@ impl IslandView {
             live: live_glass::LiveGlass::new(),
             static_glass: None,
             live_on: false,
+            live_env: live_glass::Mode::Static,
+            live_armed: false,
             notices: Queue::new(),
             now_playing: NowPlaying::idle(),
             tray: None,
@@ -348,7 +354,7 @@ impl IslandView {
         if self.endpoint.is_none() {
             self.endpoint = Some(Endpoint::spawn());
         }
-        self.arm_live(cx);
+        self.arm_live();
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(32)).await;
@@ -531,9 +537,16 @@ impl IslandView {
         self.glass_epoch
     }
 
-    /// Starts the live path according to `RUSTEDGE_GLASS`, or falls back.
-    fn arm_live(&mut self, cx: &mut Context<Self>) {
-        let mode = live_glass::mode_from_env(std::env::var("RUSTEDGE_GLASS").ok().as_deref());
+    /// Resolves `RUSTEDGE_GLASS` for this launch. The window handle is not
+    /// available yet, so the actual arming happens on the first live tick.
+    fn arm_live(&mut self) {
+        self.live_env =
+            live_glass::mode_from_env(std::env::var("RUSTEDGE_GLASS").ok().as_deref());
+        eprintln!("live glass: mode {:?}", self.live_env);
+    }
+
+    /// Sets capture affinity and starts the prewarm once a window handle exists.
+    fn try_arm_live(&mut self, cx: &mut Context<Self>) {
         let hwnd = cx
             .windows()
             .first()
@@ -541,9 +554,11 @@ impl IslandView {
         let Some(hwnd) = hwnd else {
             return;
         };
+        self.live_armed = true;
         self.live.prepare(hwnd);
-        self.set_live_glass(matches!(mode, live_glass::Mode::Live), cx);
+        self.set_live_glass(matches!(self.live_env, live_glass::Mode::Live), cx);
         if self.live.is_live() {
+            eprintln!("live glass: display affinity set, arming capture");
             let action = self.live.prewarm(millis_now());
             self.apply_live(action, cx);
         }
@@ -641,6 +656,10 @@ impl IslandView {
     /// Drains live capture: feed visibility, run actions, install the frame.
     /// Returns true when the glass changed.
     fn poll_live(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.live_armed {
+            self.try_arm_live(cx);
+            return false;
+        }
         let live = self.live.is_live();
         if live != self.live_on {
             self.live_on = live;
