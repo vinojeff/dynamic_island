@@ -37,6 +37,7 @@
 mod wallpaper;
 
 mod island_view;
+mod live_glass;
 mod perf_view;
 mod pointer;
 mod theme;
