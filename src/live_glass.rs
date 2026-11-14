@@ -10,7 +10,25 @@
 //! feeds events and runs the returned [`Action`]; it never touches the capture
 //! thread.
 
-use crate::wallpaper::REFRACTION_MARGIN;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use windows_capture::capture::{
+    CaptureControl, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+};
+use windows_capture::frame::Frame;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
+use windows_capture::monitor::Monitor;
+use windows_capture::settings::{
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+};
+
+use crate::wallpaper::{self, GlassBackdrop, REFRACTION_MARGIN};
 
 /// How the glass gets its pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +53,16 @@ const MAX_FAILURES: u32 = 3;
 const RETRY_BACKOFF_MS: [u64; 3] = [1_000, 2_000, 4_000];
 const CLEAN_RETRY_MS: u64 = 1_000;
 const PREWARM_MS: u64 = 2_000;
+const CAPTURE_INTERVAL_MS: u64 = 33;
+
+/// Backoff after the Nth consecutive fault, capped at the last step.
+fn backoff_after(failures: u32) -> u64 {
+    let index = usize::try_from(failures).unwrap_or(0).saturating_sub(1);
+    RETRY_BACKOFF_MS
+        .get(index.min(RETRY_BACKOFF_MS.len() - 1))
+        .copied()
+        .unwrap_or(CLEAN_RETRY_MS)
+}
 
 /// One physical crop of the primary monitor, shared with the capture thread.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,6 +75,17 @@ pub(crate) struct CropSpec {
     pub factor: u32,
     /// Logical margin around the stage, `(left, top, right, bottom)`.
     pub pad: (f32, f32, f32, f32),
+}
+
+impl CropSpec {
+    const EMPTY: Self = Self {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        factor: 1,
+        pad: (0.0, 0.0, 0.0, 0.0),
+    };
 }
 
 /// The stage clipped to the primary monitor, in physical pixels.
@@ -157,7 +196,8 @@ fn downsample(
                 }
             }
             let offset = (oy * out_width as usize + ox) * 4;
-            for (channel, value) in sum.iter().zip(&mut out[offset..offset + 4]) {
+            let target = out.get_mut(offset..offset + 4)?;
+            for (channel, value) in sum.iter().zip(target) {
                 #[allow(
                     clippy::cast_possible_truncation,
                     reason = "mean of u8 stays in u8"
@@ -222,6 +262,10 @@ pub(crate) enum StartFault {
     Unsupported,
     /// The border cannot be disabled: a full-screen capture border is worse.
     Border,
+    /// Cursor capture could not be disabled: retry with the default.
+    Cursor,
+    /// Minimum update interval is unsupported: retry with the default.
+    Interval,
     /// Transient or unknown: count against the failure budget.
     Other,
 }
@@ -371,8 +415,7 @@ impl Machine {
                     self.force_off();
                     return Action::None;
                 }
-                let wait =
-                    RETRY_BACKOFF_MS[(self.failures as usize - 1).min(RETRY_BACKOFF_MS.len() - 1)];
+                let wait = backoff_after(self.failures);
                 self.retry_at = Some(now_ms.saturating_add(wait));
                 Action::None
             }
@@ -402,9 +445,7 @@ impl Machine {
                         self.force_off();
                         return Action::None;
                     }
-                    let wait =
-                        RETRY_BACKOFF_MS
-                            [(self.failures as usize - 1).min(RETRY_BACKOFF_MS.len() - 1)];
+                    let wait = backoff_after(self.failures);
                     self.retry_at = Some(now_ms.saturating_add(wait));
                 } else {
                     self.retry_at = Some(now_ms.saturating_add(CLEAN_RETRY_MS));
@@ -457,6 +498,325 @@ impl Machine {
         self.phase = Phase::Starting;
         self.retry_at = None;
         Action::Start
+    }
+}
+
+/// The newest captured frame, overwritten by the capture thread.
+#[derive(Default)]
+struct Sink {
+    latest: Mutex<Option<Arc<GlassBackdrop>>>,
+}
+
+impl Sink {
+    fn publish(&self, frame: GlassBackdrop) {
+        let mut slot = match self.latest.lock() {
+            Ok(slot) => slot,
+            Err(poison) => PoisonError::into_inner(poison),
+        };
+        *slot = Some(Arc::new(frame));
+    }
+
+    fn take(&self) -> Option<Arc<GlassBackdrop>> {
+        match self.latest.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poison) => PoisonError::into_inner(poison).take(),
+        }
+    }
+}
+
+/// Frame-pipeline failure. Ends the session; the machine counts it.
+#[derive(Debug)]
+pub(crate) struct LiveError;
+
+impl std::fmt::Display for LiveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("live glass frame failed")
+    }
+}
+
+impl std::error::Error for LiveError {}
+
+/// Values moved onto the capture thread at start.
+pub(crate) struct HandlerFlags {
+    spec: Arc<Mutex<CropSpec>>,
+    sink: Arc<Sink>,
+}
+
+pub(crate) struct LiveHandler {
+    spec: Arc<Mutex<CropSpec>>,
+    sink: Arc<Sink>,
+}
+
+impl GraphicsCaptureApiHandler for LiveHandler {
+    type Flags = HandlerFlags;
+    type Error = LiveError;
+
+    fn new(context: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let flags = context.flags;
+        Ok(Self { spec: flags.spec, sink: flags.sink })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        _control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        let spec = match self.spec.lock() {
+            Ok(guard) => *guard,
+            Err(poison) => *PoisonError::into_inner(poison),
+        };
+        if spec.right <= spec.left || spec.bottom <= spec.top {
+            return Ok(());
+        }
+        if spec.right > frame.width() || spec.bottom > frame.height() {
+            return Ok(());
+        }
+        let mut buffer = frame
+            .buffer_crop(spec.left, spec.top, spec.right, spec.bottom)
+            .map_err(|_| LiveError)?;
+        let (width, height, pitch) = (buffer.width(), buffer.height(), buffer.row_pitch());
+        let (mut rgba, out_width, out_height) =
+            downsample(buffer.as_raw_buffer(), width, height, pitch, spec.factor)
+                .ok_or(LiveError)?;
+        wallpaper::saturate(&mut rgba, wallpaper::SATURATION);
+        let luma = wallpaper::mean_luma(&rgba);
+        let image = wallpaper::render_image_rgba(
+            usize::try_from(out_width).map_err(|_| LiveError)?,
+            usize::try_from(out_height).map_err(|_| LiveError)?,
+            &rgba,
+        )
+        .ok_or(LiveError)?;
+        self.sink.publish(GlassBackdrop { image: Arc::new(image), luma, pad: spec.pad });
+        Ok(())
+    }
+}
+
+pub(crate) type Control = CaptureControl<LiveHandler, LiveError>;
+
+/// Everything a start needs, cloned off the view before the blocking call.
+pub(crate) struct StartRequest {
+    spec: Arc<Mutex<CropSpec>>,
+    sink: Arc<Sink>,
+}
+
+fn classify_start_error<E>(error: &GraphicsCaptureApiError<E>) -> StartFault {
+    let GraphicsCaptureApiError::GraphicsCaptureApiError(error) = error else {
+        return StartFault::Other;
+    };
+    use windows_capture::graphics_capture_api::Error as CaptureError;
+    match error {
+        CaptureError::CursorConfigUnsupported => StartFault::Cursor,
+        CaptureError::BorderConfigUnsupported => StartFault::Border,
+        CaptureError::MinimumUpdateIntervalUnsupported => StartFault::Interval,
+        CaptureError::Unsupported => StartFault::Unsupported,
+        _ => StartFault::Other,
+    }
+}
+
+fn start_with(
+    cursor: CursorCaptureSettings,
+    interval: MinimumUpdateIntervalSettings,
+    request: &StartRequest,
+) -> Result<Control, StartFault> {
+    let monitor = Monitor::primary().map_err(|_| StartFault::Other)?;
+    let flags = HandlerFlags {
+        spec: Arc::clone(&request.spec),
+        sink: Arc::clone(&request.sink),
+    };
+    let settings = Settings::new(
+        monitor,
+        cursor,
+        DrawBorderSettings::WithoutBorder,
+        SecondaryWindowSettings::Default,
+        interval,
+        DirtyRegionSettings::Default,
+        ColorFormat::Rgba8,
+        flags,
+    );
+    LiveHandler::start_free_threaded(settings).map_err(|error| classify_start_error(&error))
+}
+
+/// Starts a session, degrading optional settings the OS cannot honor.
+///
+/// `start_free_threaded` blocks until WinRT/D3D are up, so the caller runs this
+/// on the background executor.
+pub(crate) fn start_session(request: StartRequest) -> Result<Control, StartFault> {
+    if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+        return Err(StartFault::Unsupported);
+    }
+    let mut cursor = CursorCaptureSettings::WithoutCursor;
+    let mut interval =
+        MinimumUpdateIntervalSettings::Custom(Duration::from_millis(CAPTURE_INTERVAL_MS));
+    for _ in 0..4 {
+        match start_with(cursor, interval, &request) {
+            Ok(control) => return Ok(control),
+            Err(StartFault::Cursor) => cursor = CursorCaptureSettings::Default,
+            Err(StartFault::Interval) => interval = MinimumUpdateIntervalSettings::Default,
+            Err(fault) => return Err(fault),
+        }
+    }
+    Err(StartFault::Other)
+}
+
+fn set_affinity(hwnd: HWND, excluded: bool) -> bool {
+    let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    // SAFETY: `hwnd` came from the overlay window and stays alive for the
+    // process; the call only changes capture affinity.
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity) != 0 }
+}
+
+/// View-side handle: owns the machine, the shared crop, and the control.
+pub(crate) struct LiveGlass {
+    machine: Machine,
+    spec: Arc<Mutex<CropSpec>>,
+    sink: Arc<Sink>,
+    control: Option<Control>,
+    luma: LumaSmoother,
+    last_frame_ms: u64,
+    hwnd: Option<HWND>,
+    enabled: bool,
+}
+
+impl LiveGlass {
+    pub(crate) fn new() -> Self {
+        Self {
+            machine: Machine::new(),
+            spec: Arc::new(Mutex::new(CropSpec::EMPTY)),
+            sink: Arc::new(Sink::default()),
+            control: None,
+            luma: LumaSmoother::new(),
+            last_frame_ms: 0,
+            hwnd: None,
+            enabled: false,
+        }
+    }
+
+    pub(crate) const fn is_live(&self) -> bool {
+        self.enabled && self.machine.is_live()
+    }
+
+    pub(crate) const fn running(&self) -> bool {
+        matches!(self.machine.phase(), Phase::Running)
+    }
+
+    pub(crate) fn prepare(&mut self, hwnd: HWND) {
+        self.hwnd = Some(hwnd);
+    }
+
+    /// Enables or disables the live path; returns false when it cannot run.
+    pub(crate) fn set_enabled(&mut self, on: bool) -> bool {
+        if on {
+            let Some(hwnd) = self.hwnd else {
+                self.enabled = false;
+                self.machine.force_off();
+                return false;
+            };
+            if !set_affinity(hwnd, true) {
+                self.enabled = false;
+                self.machine.force_off();
+                eprintln!("live glass: display affinity failed, falling back to the wallpaper");
+                return false;
+            }
+            self.enabled = true;
+            self.machine.rearm();
+            true
+        } else {
+            if let Some(hwnd) = self.hwnd {
+                let _ = set_affinity(hwnd, false);
+            }
+            self.enabled = false;
+            self.machine.force_off();
+            false
+        }
+    }
+
+    pub(crate) fn prewarm(&mut self, now_ms: u64) -> Action {
+        self.machine.handle(Event::Prewarm, now_ms)
+    }
+
+    pub(crate) fn update_crop(&mut self, stage: (i32, i32, u32, u32), scale: f32) {
+        let Some(spec) = crop_spec(stage, scale, wallpaper::screen_size()) else {
+            return;
+        };
+        let mut slot = match self.spec.lock() {
+            Ok(slot) => slot,
+            Err(poison) => PoisonError::into_inner(poison),
+        };
+        if *slot != spec {
+            *slot = spec;
+        }
+    }
+
+    /// Feeds visibility and time, and returns the action to run.
+    pub(crate) fn tick(&mut self, wanted: bool, now_ms: u64) -> Action {
+        let mut action = self.machine.handle(Event::SetWanted(wanted), now_ms);
+        if action == Action::None {
+            action = self.machine.handle(Event::RetryDue, now_ms);
+        }
+        if let Some(deadline) = self.machine.prewarm_deadline() {
+            if now_ms >= deadline {
+                let next = self.machine.handle(Event::PrewarmDeadline, now_ms);
+                if next != Action::None {
+                    action = next;
+                }
+            }
+        }
+        action
+    }
+
+    pub(crate) fn start_request(&self) -> StartRequest {
+        StartRequest { spec: Arc::clone(&self.spec), sink: Arc::clone(&self.sink) }
+    }
+
+    pub(crate) fn start_done(&mut self, result: Result<Control, StartFault>, now_ms: u64) -> Action {
+        match result {
+            Ok(control) => {
+                self.control = Some(control);
+                self.machine.handle(Event::StartOk, now_ms)
+            }
+            Err(fault) => self.machine.handle(Event::StartErr(fault), now_ms),
+        }
+    }
+
+    pub(crate) fn control_finished(&self) -> bool {
+        self.control.as_ref().is_some_and(|control| control.is_finished())
+    }
+
+    pub(crate) fn take_control(&mut self) -> Option<Control> {
+        self.control.take()
+    }
+
+    pub(crate) fn session_ended(&mut self, error: bool, now_ms: u64) -> Action {
+        self.machine.handle(Event::SessionEnded { error }, now_ms)
+    }
+
+    pub(crate) fn stop_done(&mut self, now_ms: u64) -> Action {
+        self.machine.handle(Event::StopDone, now_ms)
+    }
+
+    /// Takes the newest frame, smooths its luma, and reports the machine action.
+    ///
+    /// Frames are only installed while the session is `Running`; a frame that
+    /// lands during `Stopping` stays in the slot as the next cache but is not
+    /// painted.
+    pub(crate) fn take_frame(&mut self, now_ms: u64) -> (Option<Arc<GlassBackdrop>>, Action) {
+        if !self.running() {
+            return (None, Action::None);
+        }
+        let Some(raw) = self.sink.take() else {
+            return (None, Action::None);
+        };
+        #[allow(clippy::cast_precision_loss, reason = "milliseconds fit in f32 for this use")]
+        let dt = now_ms.saturating_sub(self.last_frame_ms) as f32;
+        self.last_frame_ms = now_ms;
+        let luma = self.luma.push(raw.luma, dt);
+        let action = self.machine.handle(Event::Frame, now_ms);
+        let frame = Arc::new(GlassBackdrop {
+            image: Arc::clone(&raw.image),
+            luma,
+            pad: raw.pad,
+        });
+        (Some(frame), action)
     }
 }
 
@@ -668,5 +1028,40 @@ mod tests {
         // A stale prewarm marker must not start a session while collapsed.
         assert_eq!(machine.handle(Event::RetryDue, 10_000), Action::None);
         assert_eq!(machine.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn start_errors_degrade_by_kind() {
+        use windows_capture::graphics_capture_api::Error as CaptureError;
+
+        let wrap = |error| GraphicsCaptureApiError::<()>::GraphicsCaptureApiError(error);
+        assert_eq!(
+            classify_start_error(&wrap(CaptureError::CursorConfigUnsupported)),
+            StartFault::Cursor
+        );
+        assert_eq!(
+            classify_start_error(&wrap(CaptureError::BorderConfigUnsupported)),
+            StartFault::Border
+        );
+        assert_eq!(
+            classify_start_error(&wrap(CaptureError::MinimumUpdateIntervalUnsupported)),
+            StartFault::Interval
+        );
+        assert_eq!(
+            classify_start_error(&wrap(CaptureError::Unsupported)),
+            StartFault::Unsupported
+        );
+        assert_eq!(
+            classify_start_error(&GraphicsCaptureApiError::<()>::ItemConvertFailed),
+            StartFault::Other
+        );
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(backoff_after(1), 1_000);
+        assert_eq!(backoff_after(2), 2_000);
+        assert_eq!(backoff_after(3), 4_000);
+        assert_eq!(backoff_after(9), 4_000);
     }
 }
