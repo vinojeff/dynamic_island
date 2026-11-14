@@ -31,6 +31,10 @@ pub(crate) fn mode_from_env(value: Option<&str>) -> Mode {
 }
 
 const LUMA_TAU_MS: f32 = 200.0;
+const MAX_FAILURES: u32 = 3;
+const RETRY_BACKOFF_MS: [u64; 3] = [1_000, 2_000, 4_000];
+const CLEAN_RETRY_MS: u64 = 1_000;
+const PREWARM_MS: u64 = 2_000;
 
 /// One physical crop of the primary monitor, shared with the capture thread.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,6 +197,269 @@ impl LumaSmoother {
     }
 }
 
+/// Where the capture session is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Off,
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+}
+
+/// What the view should do on the executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    None,
+    Start,
+    Stop,
+}
+
+/// How a failed start should be treated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartFault {
+    /// WGC or WDA is not available: fall back for this launch.
+    Unsupported,
+    /// The border cannot be disabled: a full-screen capture border is worse.
+    Border,
+    /// Transient or unknown: count against the failure budget.
+    Other,
+}
+
+/// One input to the session machine.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Event {
+    SetWanted(bool),
+    Prewarm,
+    StartOk,
+    StartErr(StartFault),
+    Frame,
+    SessionEnded { error: bool },
+    PrewarmDeadline,
+    RetryDue,
+    StopDone,
+}
+
+/// Capture lifecycle without any threading or Windows types.
+pub(crate) struct Machine {
+    phase: Phase,
+    wanted: bool,
+    /// Desired visibility to apply when the current transition finishes.
+    after: Option<bool>,
+    failures: u32,
+    retry_at: Option<u64>,
+    prewarm: bool,
+    prewarm_deadline: Option<u64>,
+}
+
+impl Machine {
+    pub(crate) const fn new() -> Self {
+        Self {
+            phase: Phase::Idle,
+            wanted: false,
+            after: None,
+            failures: 0,
+            retry_at: None,
+            prewarm: false,
+            prewarm_deadline: None,
+        }
+    }
+
+    pub(crate) const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    pub(crate) const fn is_live(&self) -> bool {
+        !matches!(self.phase, Phase::Off)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    pub(crate) const fn prewarm_deadline(&self) -> Option<u64> {
+        self.prewarm_deadline
+    }
+
+    pub(crate) fn rearm(&mut self) {
+        self.phase = Phase::Idle;
+        self.wanted = false;
+        self.after = None;
+        self.failures = 0;
+        self.retry_at = None;
+        self.prewarm = false;
+        self.prewarm_deadline = None;
+    }
+
+    pub(crate) fn force_off(&mut self) {
+        self.phase = Phase::Off;
+        self.after = None;
+        self.prewarm = false;
+        self.prewarm_deadline = None;
+    }
+
+    pub(crate) fn handle(&mut self, event: Event, now_ms: u64) -> Action {
+        match event {
+            Event::SetWanted(on) => {
+                self.wanted = on;
+                if on {
+                    // An expand supersedes the warm cache: the session should
+                    // keep running, not stop after its first frame.
+                    self.prewarm = false;
+                    self.prewarm_deadline = None;
+                }
+                match self.phase {
+                    Phase::Off => Action::None,
+                    Phase::Idle => {
+                        if on {
+                            self.start(now_ms)
+                        } else {
+                            Action::None
+                        }
+                    }
+                    Phase::Starting | Phase::Stopping => {
+                        self.after = Some(on);
+                        Action::None
+                    }
+                    Phase::Running => {
+                        if on {
+                            Action::None
+                        } else {
+                            self.phase = Phase::Stopping;
+                            self.after = Some(false);
+                            Action::Stop
+                        }
+                    }
+                }
+            }
+            Event::Prewarm => {
+                self.prewarm = true;
+                if self.phase != Phase::Idle || self.wanted {
+                    return Action::None;
+                }
+                let action = self.start(now_ms);
+                if action == Action::Start {
+                    self.prewarm_deadline = Some(now_ms.saturating_add(PREWARM_MS));
+                }
+                action
+            }
+            Event::StartOk => {
+                if self.phase != Phase::Starting {
+                    return Action::None;
+                }
+                self.phase = Phase::Running;
+                if !self.prewarm {
+                    self.prewarm_deadline = None;
+                }
+                let want = self.after.take().unwrap_or(self.wanted);
+                if !want && !self.prewarm {
+                    self.phase = Phase::Stopping;
+                    Action::Stop
+                } else {
+                    Action::None
+                }
+            }
+            Event::StartErr(fault) => {
+                if matches!(fault, StartFault::Unsupported | StartFault::Border) {
+                    self.force_off();
+                    return Action::None;
+                }
+                self.failures = self.failures.saturating_add(1);
+                self.phase = Phase::Idle;
+                if self.failures >= MAX_FAILURES {
+                    self.force_off();
+                    return Action::None;
+                }
+                let wait =
+                    RETRY_BACKOFF_MS[(self.failures as usize - 1).min(RETRY_BACKOFF_MS.len() - 1)];
+                self.retry_at = Some(now_ms.saturating_add(wait));
+                Action::None
+            }
+            Event::Frame => {
+                self.failures = 0;
+                self.retry_at = None;
+                let was_warming = self.prewarm;
+                self.prewarm = false;
+                self.prewarm_deadline = None;
+                if was_warming && self.phase == Phase::Running && !self.wanted {
+                    self.phase = Phase::Stopping;
+                    self.after = Some(false);
+                    Action::Stop
+                } else {
+                    Action::None
+                }
+            }
+            Event::SessionEnded { error } => {
+                if !matches!(self.phase, Phase::Running | Phase::Starting) {
+                    return Action::None;
+                }
+                self.phase = Phase::Idle;
+                self.prewarm_deadline = None;
+                if error {
+                    self.failures = self.failures.saturating_add(1);
+                    if self.failures >= MAX_FAILURES {
+                        self.force_off();
+                        return Action::None;
+                    }
+                    let wait =
+                        RETRY_BACKOFF_MS
+                            [(self.failures as usize - 1).min(RETRY_BACKOFF_MS.len() - 1)];
+                    self.retry_at = Some(now_ms.saturating_add(wait));
+                } else {
+                    self.retry_at = Some(now_ms.saturating_add(CLEAN_RETRY_MS));
+                }
+                Action::None
+            }
+            Event::PrewarmDeadline => {
+                if self.prewarm_deadline.is_none() {
+                    return Action::None;
+                }
+                self.prewarm = false;
+                self.prewarm_deadline = None;
+                if self.phase == Phase::Running && !self.wanted {
+                    self.phase = Phase::Stopping;
+                    self.after = Some(false);
+                    Action::Stop
+                } else {
+                    Action::None
+                }
+            }
+            Event::RetryDue => {
+                if self.phase != Phase::Idle || !(self.wanted || self.prewarm) {
+                    return Action::None;
+                }
+                let action = self.start(now_ms);
+                if action == Action::Start && self.prewarm && !self.wanted {
+                    self.prewarm_deadline = Some(now_ms.saturating_add(PREWARM_MS));
+                }
+                action
+            }
+            Event::StopDone => {
+                self.phase = Phase::Idle;
+                if !self.prewarm {
+                    self.prewarm_deadline = None;
+                }
+                let want = self.after.take().unwrap_or(self.wanted);
+                if want {
+                    self.start(now_ms)
+                } else {
+                    Action::None
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, now_ms: u64) -> Action {
+        if self.phase != Phase::Idle || self.retry_at.is_some_and(|at| now_ms < at) {
+            return Action::None;
+        }
+        self.phase = Phase::Starting;
+        self.retry_at = None;
+        Action::Start
+    }
+}
+
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
@@ -275,5 +542,131 @@ mod tests {
         let next = smoother.push(0.0, 33.0);
         assert!(next > 0.0 && next < 0.8);
         assert!(smoother.push(2.0, 1_000.0) <= 1.0);
+    }
+
+    fn running(machine: &mut Machine) {
+        assert_eq!(machine.handle(Event::SetWanted(true), 0), Action::Start);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::None);
+    }
+
+    fn fail_once(machine: &mut Machine, now: u64) {
+        assert_eq!(machine.handle(Event::SetWanted(true), now), Action::Start);
+        assert_eq!(machine.handle(Event::StartErr(StartFault::Other), now), Action::None);
+        assert_eq!(machine.handle(Event::RetryDue, now + 10_000), Action::Start);
+    }
+
+    #[test]
+    fn expand_starts_and_collapse_stops() {
+        let mut machine = Machine::new();
+        running(&mut machine);
+        assert_eq!(machine.handle(Event::SetWanted(false), 0), Action::Stop);
+        assert_eq!(machine.handle(Event::StopDone, 0), Action::None);
+        assert_eq!(machine.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn collapse_during_start_stops_after_ok() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.handle(Event::SetWanted(true), 0), Action::Start);
+        assert_eq!(machine.handle(Event::SetWanted(false), 0), Action::None);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::Stop);
+    }
+
+    #[test]
+    fn expand_during_stop_restarts_after_done() {
+        let mut machine = Machine::new();
+        running(&mut machine);
+        assert_eq!(machine.handle(Event::SetWanted(false), 0), Action::Stop);
+        assert_eq!(machine.handle(Event::SetWanted(true), 0), Action::None);
+        assert_eq!(machine.handle(Event::StopDone, 0), Action::Start);
+    }
+
+    #[test]
+    fn three_faults_turn_the_live_path_off() {
+        let mut machine = Machine::new();
+        fail_once(&mut machine, 0);
+        assert_eq!(machine.handle(Event::StartErr(StartFault::Other), 1), Action::None);
+        assert_eq!(machine.handle(Event::RetryDue, 20_000), Action::Start);
+        assert_eq!(machine.handle(Event::StartErr(StartFault::Other), 20_000), Action::None);
+        assert_eq!(machine.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn a_frame_clears_the_failure_budget() {
+        let mut machine = Machine::new();
+        fail_once(&mut machine, 0);
+        assert_eq!(machine.handle(Event::StartOk, 1), Action::None);
+        assert_eq!(machine.handle(Event::Frame, 1), Action::None);
+        assert_eq!(machine.failures(), 0);
+    }
+
+    #[test]
+    fn unsupported_and_border_faults_fall_back_immediately() {
+        for fault in [StartFault::Unsupported, StartFault::Border] {
+            let mut machine = Machine::new();
+            assert_eq!(machine.handle(Event::SetWanted(true), 0), Action::Start);
+            assert_eq!(machine.handle(Event::StartErr(fault), 0), Action::None);
+            assert_eq!(machine.phase(), Phase::Off);
+        }
+    }
+
+    #[test]
+    fn clean_session_end_retries_without_charging() {
+        let mut machine = Machine::new();
+        running(&mut machine);
+        assert_eq!(machine.handle(Event::SessionEnded { error: false }, 0), Action::None);
+        assert_eq!(machine.failures(), 0);
+        assert_eq!(machine.handle(Event::RetryDue, 999), Action::None);
+        assert_eq!(machine.handle(Event::RetryDue, 1_000), Action::Start);
+    }
+
+    #[test]
+    fn error_session_end_charges_once() {
+        let mut machine = Machine::new();
+        running(&mut machine);
+        assert_eq!(machine.handle(Event::SessionEnded { error: true }, 0), Action::None);
+        assert_eq!(machine.failures(), 1);
+        assert_eq!(machine.handle(Event::RetryDue, 999), Action::None);
+    }
+
+    #[test]
+    fn prewarm_caches_one_frame_then_stops() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.handle(Event::Prewarm, 0), Action::Start);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::None);
+        assert_eq!(machine.handle(Event::Frame, 100), Action::Stop);
+        assert_eq!(machine.handle(Event::StopDone, 100), Action::None);
+    }
+
+    #[test]
+    fn prewarm_deadline_only_drops_the_marker() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.handle(Event::Prewarm, 0), Action::Start);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::None);
+        assert_eq!(machine.handle(Event::PrewarmDeadline, 2_000), Action::Stop);
+        assert_eq!(machine.failures(), 0);
+    }
+
+    #[test]
+    fn hidden_means_collapsed() {
+        let mut machine = Machine::new();
+        running(&mut machine);
+        assert_eq!(machine.handle(Event::SetWanted(false), 0), Action::Stop);
+    }
+
+    #[test]
+    fn expand_during_prewarm_does_not_restart_after_collapse() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.handle(Event::Prewarm, 0), Action::Start);
+        assert_eq!(machine.handle(Event::StartOk, 0), Action::None);
+        // The user expands before the warm frame arrives: the session simply
+        // continues, and no stop-on-first-frame is pending any more.
+        assert_eq!(machine.handle(Event::SetWanted(true), 10), Action::None);
+        assert_eq!(machine.handle(Event::Frame, 20), Action::None);
+        assert_eq!(machine.handle(Event::SetWanted(false), 30), Action::Stop);
+        assert_eq!(machine.handle(Event::StopDone, 40), Action::None);
+        // A stale prewarm marker must not start a session while collapsed.
+        assert_eq!(machine.handle(Event::RetryDue, 10_000), Action::None);
+        assert_eq!(machine.phase(), Phase::Idle);
     }
 }
