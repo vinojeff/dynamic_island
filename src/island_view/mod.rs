@@ -194,6 +194,10 @@ pub struct IslandView {
     static_generation: u64,
     /// Smoothed backdrop lightness; `Face` reads this directly.
     glass_luma: f32,
+    /// The newest live crop, kept around for shape-only re-warps.
+    last_live_raw: Option<std::sync::Arc<wallpaper::RawGlass>>,
+    /// The generation `last_live_raw` was captured under. `MAX` means none.
+    live_generation: u64,
     /// Pending, in-flight, and failed glass warps. Install rules live in
     /// [`Self::finish_warp`].
     warps: WarpQueue,
@@ -267,6 +271,8 @@ impl IslandView {
             static_raw: None,
             static_generation: 0,
             glass_luma: glass::IDLE_LUMA,
+            last_live_raw: None,
+            live_generation: u64::MAX,
             warps: WarpQueue::default(),
             live: live_glass::LiveGlass::new(),
             static_glass: None,
@@ -717,6 +723,8 @@ impl IslandView {
         self.glass_fingerprint = None;
         self.glass_epoch = self.glass_epoch.saturating_add(1);
         self.glass_building = false;
+        self.last_live_raw = None;
+        self.live_generation = u64::MAX;
         self.warps.clear_pending();
     }
 
@@ -797,11 +805,23 @@ impl IslandView {
         }
         let now = millis_now();
         let wanted = self.state != IslandState::Line && !self.hidden && !self.exclusive;
+        let shape = GlassShape::from(self.shown.shape.get());
         // Always keep the crop current while live, even when collapsed: the
         // prewarm session and the first expand both need a valid rect before
         // `wanted` ever turns true. Unchanged specs are a cheap comparison.
         if let Some((x, y, width, height, scale)) = placed_stage(cx) {
-            self.live.update_crop((x, y, width, height), scale);
+            if self.live.update_crop((x, y, width, height), scale, shape) {
+                // Stale geometry cannot be re-warped: fall back to the wash
+                // until a frame with the new crop arrives. Clearing
+                // `static_glass` too lets the 2s poll rebuild the fallback
+                // for the new rect (poll_glass early-returns while live &&
+                // static_glass.is_some()).
+                self.last_live_raw = None;
+                self.live_generation = u64::MAX;
+                self.glass = None;
+                self.static_glass = None;
+                self.warps.clear_dest(WarpDest::Live);
+            }
         }
         let action = self.live.tick(wanted, now);
         self.apply_live(action, cx);
@@ -828,13 +848,20 @@ impl IslandView {
 
         let (frame, action) = self.live.take_frame(now);
         self.apply_live(action, cx);
+        let mut changed = false;
         if let Some(frame) = frame {
+            self.live_generation = frame.generation;
+            self.last_live_raw = Some(frame.raw);
+            if (self.glass_luma - frame.luma).abs() > f32::EPSILON {
+                changed = true; // the scrim follows the smoothed luma
+            }
             self.glass_luma = frame.luma;
-            self.glass = Some(frame);
-            true
-        } else {
-            false
+            if let Some(warped) = frame.warped {
+                self.glass = Some(warped);
+                changed = true;
+            }
         }
+        changed
     }
 
     fn poll_tray(&mut self, cx: &mut Context<Self>) {

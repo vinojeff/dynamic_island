@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::glass_optics::{GlassShape, Rect};
-use crate::wallpaper::{self, GlassBackdrop, REFRACTION_MARGIN};
+use crate::wallpaper::{self, GlassBackdrop, RawGlass, REFRACTION_MARGIN};
 
 /// How the glass gets its pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,9 +66,9 @@ fn backoff_after(failures: u32) -> u64 {
         .unwrap_or(CLEAN_RETRY_MS)
 }
 
-/// One physical crop of the primary monitor, shared with the capture thread.
+/// The physical crop plus the geometry the warp and lens need.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CropSpec {
+pub(crate) struct CropGeometry {
     pub left: u32,
     pub top: u32,
     pub right: u32,
@@ -77,16 +77,35 @@ pub(crate) struct CropSpec {
     pub factor: u32,
     /// Crop rect in logical px relative to the window's top-left.
     pub crop: Rect,
+    /// Image pixels per logical pixel: `scale / factor`.
+    pub image_scale: f32,
+    /// Unclipped stage width in logical pixels.
+    pub stage_width: f32,
+}
+
+/// One physical crop of the primary monitor, plus the shape to bake.
+///
+/// `shape` changes every morph tick while `geometry` only moves on a slide or
+/// a DPI change; only a geometry change invalidates the last raw frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CropSpec {
+    pub geometry: CropGeometry,
+    pub shape: GlassShape,
 }
 
 impl CropSpec {
     const EMPTY: Self = Self {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-        factor: 1,
-        crop: Rect::ZERO,
+        geometry: CropGeometry {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            factor: 1,
+            crop: Rect::ZERO,
+            image_scale: 1.0,
+            stage_width: 0.0,
+        },
+        shape: GlassShape::ZERO,
     };
 }
 
@@ -120,6 +139,7 @@ pub(crate) fn crop_spec(
     stage: (i32, i32, u32, u32),
     scale: f32,
     screen: (u32, u32),
+    shape: GlassShape,
 ) -> Option<CropSpec> {
     if screen.0 == 0 || screen.1 == 0 || !scale.is_finite() || scale <= 0.0 {
         return None;
@@ -135,7 +155,7 @@ pub(crate) fn crop_spec(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        reason = "40 logical pixels times a small DPI factor"
+        reason = "48 logical pixels times a small DPI factor"
     )]
     let margin = (REFRACTION_MARGIN * scale).round().max(0.0) as u32;
     let (sx, sy, sw, sh) = stage_on_screen(stage, screen)?;
@@ -149,7 +169,20 @@ pub(crate) fn crop_spec(
         return None;
     }
     let crop = wallpaper::crop_rect(left, top, right, bottom, (stage.0, stage.1), scale);
-    Some(CropSpec { left, top, right, bottom, factor, crop })
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pixel counts are far under f32's 24-bit mantissa"
+    )]
+    let image_scale = scale / factor as f32;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pixel counts are far under f32's 24-bit mantissa"
+    )]
+    let stage_width = stage.2 as f32 / scale;
+    Some(CropSpec {
+        geometry: CropGeometry { left, top, right, bottom, factor, crop, image_scale, stage_width },
+        shape,
+    })
 }
 
 /// Box-averages `factor x factor` blocks of an RGBA frame.
@@ -508,10 +541,24 @@ impl Machine {
     }
 }
 
+/// One captured frame: the raw crop (kept for shape-only re-warps) and the
+/// backdrop the capture thread already warped. Named `LiveFrame` to stay
+/// clear of `windows_capture::frame::Frame`.
+pub(crate) struct LiveFrame {
+    /// The unrefracted crop.
+    pub raw: Arc<RawGlass>,
+    /// The warped backdrop, or `None` when the warp failed.
+    pub warped: Option<Arc<GlassBackdrop>>,
+    /// Monotonic per-session frame counter.
+    pub generation: u64,
+    /// Raw lightness; `take_frame` replaces it with the smoothed value.
+    pub luma: f32,
+}
+
 /// The newest captured frame, overwritten by the capture thread.
 #[derive(Default)]
 struct Sink {
-    latest: Mutex<Option<GlassBackdrop>>,
+    latest: Mutex<Option<LiveFrame>>,
     next_generation: AtomicU64,
 }
 
@@ -520,7 +567,7 @@ impl Sink {
         self.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn publish(&self, frame: GlassBackdrop) {
+    fn publish(&self, frame: LiveFrame) {
         let mut slot = match self.latest.lock() {
             Ok(slot) => slot,
             Err(poison) => PoisonError::into_inner(poison),
@@ -528,7 +575,7 @@ impl Sink {
         *slot = Some(frame);
     }
 
-    fn take(&self) -> Option<GlassBackdrop> {
+    fn take(&self) -> Option<LiveFrame> {
         match self.latest.lock() {
             Ok(mut slot) => slot.take(),
             Err(poison) => PoisonError::into_inner(poison).take(),
@@ -577,36 +624,43 @@ impl GraphicsCaptureApiHandler for LiveHandler {
             Ok(guard) => *guard,
             Err(poison) => *PoisonError::into_inner(poison),
         };
-        if spec.right <= spec.left || spec.bottom <= spec.top {
+        if spec.geometry.right <= spec.geometry.left
+            || spec.geometry.bottom <= spec.geometry.top
+        {
             return Ok(());
         }
-        if spec.right > frame.width() || spec.bottom > frame.height() {
+        if spec.geometry.right > frame.width() || spec.geometry.bottom > frame.height() {
             return Ok(());
         }
         let mut buffer = frame
-            .buffer_crop(spec.left, spec.top, spec.right, spec.bottom)
+            .buffer_crop(
+                spec.geometry.left,
+                spec.geometry.top,
+                spec.geometry.right,
+                spec.geometry.bottom,
+            )
             .map_err(|_| LiveError)?;
         let (width, height, pitch) = (buffer.width(), buffer.height(), buffer.row_pitch());
         let (mut rgba, out_width, out_height) =
-            downsample(buffer.as_raw_buffer(), width, height, pitch, spec.factor)
+            downsample(buffer.as_raw_buffer(), width, height, pitch, spec.geometry.factor)
                 .ok_or(LiveError)?;
         wallpaper::saturate(&mut rgba, wallpaper::SATURATION);
         let luma = wallpaper::mean_luma(&rgba);
-        let image = wallpaper::render_image_rgba(
-            usize::try_from(out_width).map_err(|_| LiveError)?,
-            usize::try_from(out_height).map_err(|_| LiveError)?,
-            &rgba,
-        )
-        .ok_or(LiveError)?;
-        // Unwarped for now: the live warp lands with the CropGeometry split.
         let generation = self.sink.next_generation();
-        self.sink.publish(GlassBackdrop {
-            image: Arc::new(image),
+        let raw = Arc::new(RawGlass {
+            rgba,
+            width: usize::try_from(out_width).map_err(|_| LiveError)?,
+            height: usize::try_from(out_height).map_err(|_| LiveError)?,
+            crop: spec.geometry.crop,
+            image_scale: spec.geometry.image_scale,
+            stage_width: spec.geometry.stage_width,
             luma,
-            crop: spec.crop,
-            shape: GlassShape::ZERO,
             generation,
         });
+        // The capture thread warps with the newest shape; the view re-warps
+        // the kept raw when only the shape moved.
+        let warped = raw.warp(spec.shape, None).map(Arc::new);
+        self.sink.publish(LiveFrame { raw, warped, generation, luma });
         Ok(())
     }
 }
@@ -754,17 +808,24 @@ impl LiveGlass {
         self.machine.handle(Event::Prewarm, now_ms)
     }
 
-    pub(crate) fn update_crop(&mut self, stage: (i32, i32, u32, u32), scale: f32) {
-        let Some(spec) = crop_spec(stage, scale, wallpaper::screen_size()) else {
-            return;
+    pub(crate) fn update_crop(
+        &mut self,
+        stage: (i32, i32, u32, u32),
+        scale: f32,
+        shape: GlassShape,
+    ) -> bool {
+        let Some(spec) = crop_spec(stage, scale, wallpaper::screen_size(), shape) else {
+            return false;
         };
         let mut slot = match self.spec.lock() {
             Ok(slot) => slot,
             Err(poison) => PoisonError::into_inner(poison),
         };
+        let geometry_changed = slot.geometry != spec.geometry;
         if *slot != spec {
             *slot = spec;
         }
+        geometry_changed
     }
 
     /// Feeds visibility and time, and returns the action to run.
@@ -825,25 +886,27 @@ impl LiveGlass {
     /// Frames are only installed while the session is `Running`; a frame that
     /// lands during `Stopping` stays in the slot as the next cache but is not
     /// painted.
-    pub(crate) fn take_frame(&mut self, now_ms: u64) -> (Option<Arc<GlassBackdrop>>, Action) {
+    pub(crate) fn take_frame(&mut self, now_ms: u64) -> (Option<LiveFrame>, Action) {
         if !self.running() {
             return (None, Action::None);
         }
-        let Some(raw) = self.sink.take() else {
+        let Some(mut frame) = self.sink.take() else {
             return (None, Action::None);
         };
         #[allow(clippy::cast_precision_loss, reason = "milliseconds fit in f32 for this use")]
         let dt = now_ms.saturating_sub(self.last_frame_ms) as f32;
         self.last_frame_ms = now_ms;
-        let luma = self.luma.push(raw.luma, dt);
+        frame.luma = self.luma.push(frame.luma, dt);
+        if let Some(warped) = frame.warped.take() {
+            frame.warped = Some(Arc::new(GlassBackdrop {
+                image: Arc::clone(&warped.image),
+                luma: frame.luma,
+                crop: warped.crop,
+                shape: warped.shape,
+                generation: warped.generation,
+            }));
+        }
         let action = self.machine.handle(Event::Frame, now_ms);
-        let frame = Arc::new(GlassBackdrop {
-            image: Arc::clone(&raw.image),
-            luma,
-            crop: raw.crop,
-            shape: raw.shape,
-            generation: raw.generation,
-        });
         (Some(frame), action)
     }
 }
@@ -862,36 +925,68 @@ mod tests {
         assert_eq!(mode_from_env(None), Mode::Live);
     }
 
+    fn card_shape() -> GlassShape {
+        GlassShape { width: 420.0, height: 288.0, radius: 24.0 }
+    }
+
+    #[test]
+    fn crop_spec_carries_shape_geometry_and_image_scale() {
+        let spec = crop_spec((100, 0, 420, 360), 2.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(spec.geometry.factor, 2);
+        assert!((spec.geometry.image_scale - 1.0).abs() < 1e-6);
+        assert!((spec.geometry.stage_width - 210.0).abs() < 1e-4);
+        assert_eq!(spec.shape, card_shape());
+    }
+
+    #[test]
+    fn update_crop_only_reports_geometry_changes() {
+        let mut live = LiveGlass::new();
+        assert!(live.update_crop((100, 0, 420, 360), 1.0, card_shape()));
+        assert!(!live.update_crop((100, 0, 420, 360), 1.0, card_shape()));
+        // Shape-only: the raw stays valid, so this is not a geometry change.
+        let morphed = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
+        assert!(!live.update_crop((100, 0, 420, 360), 1.0, morphed));
+        assert!(live.update_crop((140, 0, 420, 360), 1.0, morphed));
+    }
+
     #[test]
     fn crop_keeps_the_lens_margin() {
-        let spec = crop_spec((100, 0, 420, 360), 1.0, (1920, 1080)).unwrap();
-        assert_eq!((spec.left, spec.top, spec.right, spec.bottom), (52, 0, 568, 408));
-        assert_eq!(spec.factor, 1);
-        assert!((spec.crop.x - -48.0).abs() < 1e-4);
-        assert!((spec.crop.y - 0.0).abs() < 1e-4);
-        assert!((spec.crop.width - 516.0).abs() < 1e-4);
-        assert!((spec.crop.height - 408.0).abs() < 1e-4);
+        let spec = crop_spec((100, 0, 420, 360), 1.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(
+            (
+                spec.geometry.left,
+                spec.geometry.top,
+                spec.geometry.right,
+                spec.geometry.bottom
+            ),
+            (52, 0, 568, 408)
+        );
+        assert_eq!(spec.geometry.factor, 1);
+        assert!((spec.geometry.crop.x - -48.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.y - 0.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 516.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.height - 408.0).abs() < 1e-4);
     }
 
     #[test]
     fn crop_clamps_at_screen_edges() {
-        let left = crop_spec((0, 0, 420, 360), 1.0, (1920, 1080)).unwrap();
-        assert_eq!(left.left, 0);
-        assert!(left.crop.x.abs() < 1e-6);
-        assert!(left.crop.y.abs() < 1e-6);
+        let left = crop_spec((0, 0, 420, 360), 1.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(left.geometry.left, 0);
+        assert!(left.geometry.crop.x.abs() < 1e-6);
+        assert!(left.geometry.crop.y.abs() < 1e-6);
 
-        assert!(crop_spec((2000, 0, 420, 360), 1.0, (1920, 1080)).is_none());
+        assert!(crop_spec((2000, 0, 420, 360), 1.0, (1920, 1080), card_shape()).is_none());
     }
 
     #[test]
     fn crop_is_a_whole_number_of_blocks() {
-        let spec = crop_spec((90, 0, 1260, 1080), 3.0, (1920, 1080)).unwrap();
-        assert_eq!(spec.factor, 3);
-        assert_eq!((spec.right - spec.left) % 3, 0);
-        assert_eq!((spec.bottom - spec.top) % 3, 0);
+        let spec = crop_spec((90, 0, 1260, 1080), 3.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(spec.geometry.factor, 3);
+        assert_eq!((spec.geometry.right - spec.geometry.left) % 3, 0);
+        assert_eq!((spec.geometry.bottom - spec.geometry.top) % 3, 0);
         // The stage starts 90 px in, so the crop reaches 30 px left of the window.
-        assert!((spec.crop.x - -30.0).abs() < 1e-4);
-        assert!((spec.crop.width - 498.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.x - -30.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 498.0).abs() < 1e-4);
     }
 
     #[test]
