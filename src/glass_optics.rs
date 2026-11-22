@@ -265,6 +265,12 @@ pub fn blur(rgba: &mut [u8], width: usize, height: usize, sigma: f32) {
 
 /// One clamped-edge box pass over rows (`horizontal`) or columns. The running
 /// window sum keeps every pixel O(1); out-of-range steps clamp to the border.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "the window division is 0..=255 by construction; window itself is a 5-tap count; pixel offsets are tiny"
+)]
 fn box_pass(
     src: &[u8],
     dst: &mut [u8],
@@ -273,16 +279,6 @@ fn box_pass(
     radius: usize,
     horizontal: bool,
 ) {
-    let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
-    if lines == 0 || line_len == 0 {
-        return;
-    }
-    let last = line_len - 1;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "the window is 5 taps; the conversion is exact in u32 range"
-    )]
-    let window = (2 * radius + 1) as u32;
     fn add_pixel(src: &[u8], base: usize, sums: &mut [u32; 4]) {
         if let Some(tap) = src.get(base..base + 4) {
             for (sum, value) in sums.iter_mut().zip(tap) {
@@ -297,6 +293,16 @@ fn box_pass(
             }
         }
     }
+    let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
+    if lines == 0 || line_len == 0 {
+        return;
+    }
+    let last = line_len - 1;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the window is 5 taps; the conversion is exact in u32 range"
+    )]
+    let window = (2 * radius + 1) as u32;
     for line in 0..lines {
         let base_of = |i: usize| {
             if horizontal {
@@ -343,7 +349,7 @@ fn box_pass(
 #[must_use]
 pub fn displacement(
     lut: &[f32; BEND_STEPS],
-    p: (f32, f32),
+    pixel: (f32, f32),
     shell: Shell,
     bevel_px: f32,
     margins: Margins,
@@ -353,7 +359,7 @@ pub fn displacement(
     }
     let center = shell.center();
     let half = shell.half();
-    let local = (p.0 - center.0, p.1 - center.1);
+    let local = (pixel.0 - center.0, pixel.1 - center.1);
     let d = -sd_round_rect(local, half, shell.radius);
     // Pixel centers sit half a pixel off the geometry, and the exact arc
     // point carries float error, so centers up to a pixel outside the
@@ -363,7 +369,7 @@ pub fn displacement(
         return None;
     }
     let d = d.max(0.0);
-    let n = sdf_normal(local, half, shell.radius)?;
+    let normal = sdf_normal(local, half, shell.radius)?;
     // Linear interpolation between LUT entries: nearest-neighbour lookup
     // quantized the bend into visible micro-rings exactly where the profile
     // is steepest.
@@ -383,10 +389,10 @@ pub fn displacement(
     let low = lut.get(index).copied().unwrap_or(0.0);
     let high = lut.get(index + 1).copied().unwrap_or(low);
     let depth = DEPTH_FACTOR * bevel_px;
-    let bend = (low + (high - low) * t) * depth * (1.0 + CORNER_BOOST * corner_term(n));
+    let bend = (low + (high - low) * t) * depth * (1.0 + CORNER_BOOST * corner_term(normal));
     Some((
-        (n.0 * bend).clamp(-margins.left, margins.right),
-        (n.1 * bend).clamp(-margins.top, margins.bottom),
+        (normal.0 * bend).clamp(-margins.left, margins.right),
+        (normal.1 * bend).clamp(-margins.top, margins.bottom),
     ))
 }
 

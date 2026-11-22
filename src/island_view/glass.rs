@@ -468,11 +468,13 @@ mod tests {
         assert_eq!(fade_progress(GLASS_FADE_MS * 10), 1.0, "clamped past the end");
         let half = fade_progress(GLASS_FADE_MS / 2);
         assert!(half > 0.4 && half < 0.6);
-        let mut t = 0.0;
-        while t <= GLASS_FADE_MS as f32 {
-            let next = fade_progress(t as u64 + 10);
-            assert!(next >= t / GLASS_FADE_MS as f32, "fade must not go backwards");
-            t += 10.0;
+        let mut previous = 0.0;
+        let mut elapsed = 0;
+        while elapsed <= GLASS_FADE_MS {
+            let t = fade_progress(elapsed);
+            assert!(t >= previous, "fade must not go backwards at {elapsed}ms");
+            previous = t;
+            elapsed += 10;
         }
     }
 
