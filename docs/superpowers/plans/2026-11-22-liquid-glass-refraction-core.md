@@ -48,6 +48,7 @@ Create `src/glass_optics.rs` with the module doc, the four types, and an empty `
 
 ```rust
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
     use super::*;
 
@@ -58,6 +59,21 @@ mod tests {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
     }
 
+    #[test]
+    fn the_shape_takes_only_morph_geometry() {
+        let morph = rustedge::island::Morph {
+            width: 320.0,
+            height: 56.0,
+            radius: 28.0,
+            shadow: 12.0,
+            detail: 0.5,
+        };
+        let shape = GlassShape::from(morph);
+        near(shape.width, 320.0);
+        near(shape.height, 56.0);
+        near(shape.radius, 28.0);
+    }
+```
     #[test]
     fn sdf_is_zero_on_the_edge_negative_inside_positive_outside() {
         near(sd_round_rect((0.0, -144.0), HALF, RADIUS), 0.0);
@@ -82,7 +98,7 @@ mod tests {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test glass_optics`
-Expected: compile error (`sd_round_rect` stub returns 0.0 → both tests FAIL).
+Expected: both tests FAIL by assertion (the stub returns 0.0).
 
 - [ ] **Step 3: Implement**
 
@@ -185,7 +201,7 @@ mod glass_optics;
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 2 tests PASS.
+Expected: 3 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -267,7 +283,7 @@ pub fn sdf_normal(p: (f32, f32), half: (f32, f32), radius: f32) -> Option<(f32, 
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 5 tests PASS.
+Expected: 6 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -317,7 +333,7 @@ pub fn bevel_width(shape: GlassShape) -> f32 {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 6 tests PASS.
+Expected: 7 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -452,7 +468,7 @@ Also add `pub(crate) const BEND_STEPS: usize = 64;` visibility as shown (`const 
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 9 tests PASS.
+Expected: 10 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -605,7 +621,7 @@ fn e_of(d: f32, bevel_px: f32) -> f32 {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 15 tests PASS.
+Expected: 16 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -744,7 +760,7 @@ pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect)
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 19 tests PASS.
+Expected: 20 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -843,6 +859,10 @@ pub const DISPERSION: f32 = 0.03;
 /// everything else is copied verbatim. Returns `None` when `src` does not
 /// match `width * height * 4`.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel counts are far under f32's 24-bit mantissa"
+)]
 pub fn warp(
     src: &[u8],
     width: usize,
@@ -928,7 +948,7 @@ fn sample_bilinear(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test glass_optics`
-Expected: 23 tests PASS.
+Expected: 24 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1089,13 +1109,20 @@ pub fn build_raw(
 ) -> Option<RawGlass> {
     // ... identical decode/compose/crop/saturate/luma body as `build` ...
     let crop = crop_rect(left, top, right, bottom, (rect.0, rect.1), scale);
+    // Carry `build`'s existing cast `#[allow]` blocks over; `stage_width`
+    // below needs the same `cast_precision_loss` allowance.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pixel counts are far under 2^24"
+    )]
+    let stage_width = rect.2 as f32 / scale;
     Some(RawGlass {
         rgba: crop_raw,
         width: cw,
         height: ch,
         crop,
         image_scale: scale,
-        stage_width: rect.2 as f32 / scale,
+        stage_width,
         luma,
         generation: 0,
     })
@@ -1154,6 +1181,8 @@ pub struct GlassBackdrop {
 Delete `pub fn build(...)` entirely (`build_raw` replaces it; Task 10 rewires the only caller).
 
 - [ ] **Step 2: `live_glass.rs` — crop rect instead of pad**
+
+Add to the imports: `use crate::glass_optics::{GlassShape, Rect};`
 
 ```rust
 pub(crate) struct CropSpec {
@@ -1239,6 +1268,8 @@ let frame = Arc::new(GlassBackdrop {
 
 - [ ] **Step 3: `island_view/mod.rs` — placeholder warp in `poll_glass`**
 
+Add to the imports: `use crate::glass_optics::GlassShape;`
+
 Replace the build spawn:
 
 ```rust
@@ -1256,12 +1287,9 @@ let built = cx
 
 - [ ] **Step 4: `island_view/glass.rs` — one-draw lens**
 
-Module doc: swap the refraction row to “one CPU SDF warp baked into the crop, [`lens`] paints it once”. Add imports:
+Module doc: swap the refraction row to “one CPU SDF warp baked into the crop, [`lens`] paints it once”, and the dispersion row to “R/G/B sample offsets inside the warp — [`glass_optics::DISPERSION`]”. The old `[`DISPERSION`]` link dies with the constant in this task. The import block ends up as (`rustedge::island::{self, IslandState}` and the `gpui_kit` list stay as they are):
 
 ```rust
-use gpui_kit::{App, Bounds, BoxShadow, Corners, ParentElement, Pixels, RenderImage, Styled, Window, canvas, div, hsla, linear_color_stop, linear_gradient, point, px, size};
-use rustedge::island::IslandState;
-use rustedge::island;
 use crate::glass_optics::{self, GlassShape, Rect};
 use crate::wallpaper;
 ```
@@ -1344,7 +1372,7 @@ fn to_bounds(rect: Rect, origin: (f32, f32)) -> Bounds<Pixels> {
 }
 ```
 
-Tests: delete `the_lens_pulls_hardest_at_the_edge_and_stops_at_the_depth`, `the_lens_reaches_the_centre_of_the_shorter_side`, `the_lens_rect_samples_outside_the_silhouette`, `shell_offset_centers_the_capsule_and_zeros_the_card`. Trim the `shell_offset(260.0)` assertion out of `rim_alpha_falls_off_inward_and_exactly_bright_at_edge`. Update the `backdrop()` helper:
+Tests: delete `the_lens_pulls_hardest_at_the_edge_and_stops_at_the_depth`, `the_lens_reaches_the_centre_of_the_shorter_side`, `the_lens_rect_samples_outside_the_silhouette`, `shell_offset_centers_the_capsule_and_zeros_the_card`. Trim the `shell_offset(260.0)` assertion out of `rim_alpha_falls_off_inward_and_exactly_bright_at_edge`, and drop `PILL_WIDTH` from the test `use` (it is now unused). Update the `backdrop()` helper:
 
 ```rust
 fn backdrop() -> Arc<wallpaper::GlassBackdrop> {
@@ -1375,7 +1403,31 @@ assert!((spec.crop.width - 516.0).abs() < 1e-4);
 assert!((spec.crop.height - 408.0).abs() < 1e-4);
 ```
 
-`crop_clamps_at_screen_edges`: replace `left.pad.0 == 0.0` / `left.pad.1 == 0.0` with `left.crop.x == 0.0` / `left.crop.y == 0.0`. Update the remaining `pad` assertions in that file the same way.
+`crop_clamps_at_screen_edges` and `crop_is_a_whole_number_of_blocks` get the same treatment — with `crop` the numbers change meaning, so write them out (margin 48):
+
+```rust
+#[test]
+fn crop_clamps_at_screen_edges() {
+    let left = crop_spec((0, 0, 420, 360), 1.0, (1920, 1080)).unwrap();
+    assert_eq!(left.left, 0);
+    assert!(left.crop.x.abs() < 1e-6);
+    assert!(left.crop.y.abs() < 1e-6);
+    assert!(crop_spec((2000, 0, 420, 360), 1.0, (1920, 1080)).is_none());
+}
+
+#[test]
+fn crop_is_a_whole_number_of_blocks() {
+    let spec = crop_spec((90, 0, 1260, 1080), 3.0, (1920, 1080)).unwrap();
+    assert_eq!(spec.factor, 3);
+    assert_eq!((spec.right - spec.left) % 3, 0);
+    assert_eq!((spec.bottom - spec.top) % 3, 0);
+    // The stage starts 90 px in, so the crop reaches 30 px left of the window.
+    assert!((spec.crop.x - -30.0).abs() < 1e-4);
+    assert!((spec.crop.width - 498.0).abs() < 1e-4);
+}
+```
+
+`crop_keeps_the_lens_margin` (already rewritten above) asserts `(52, 0, 568, 408)` and `crop = (-48, 0, 516, 408)`; `crop_clamps_at_screen_edges` keeps its off-screen `is_none` arm.
 
 - [ ] **Step 6: Run everything**
 
@@ -1405,8 +1457,10 @@ Create `src/island_view/warp_queue.rs` with the types and an empty queue, plus:
 
 ```rust
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
     use super::*;
+    use crate::glass_optics::Rect;
 
     fn raw(generation: u64) -> Arc<RawGlass> {
         Arc::new(RawGlass {
@@ -1489,7 +1543,7 @@ Expected: compile error.
 
 use std::sync::Arc;
 
-use crate::glass_optics::{GlassShape, Rect};
+use crate::glass_optics::GlassShape;
 use crate::wallpaper::RawGlass;
 
 /// Which view slot a warp result may install into.
@@ -1580,6 +1634,16 @@ impl WarpQueue {
     /// its own completion, which clears `in_flight` itself.
     pub(crate) fn clear_pending(&mut self) {
         self.pending = None;
+    }
+
+    /// Drops only the pending warps for one destination — used when a static
+    /// build fails and its queued re-warp must not run against a dead raw.
+    /// An in-flight warp for that destination still finishes; its install is
+    /// blocked by the generation check.
+    pub(crate) fn clear_dest(&mut self, dest: WarpDest) {
+        if self.pending.as_ref().is_some_and(|r| r.dest == dest) {
+            self.pending = None;
+        }
     }
 
     /// Takes the pending request for the next start.
@@ -1696,6 +1760,8 @@ fn poll_glass(&mut self, cx: &mut Context<Self>) {
                     view.static_raw = None;
                     view.static_glass = None;
                     view.static_generation = 0;
+                    // A queued static warp would run against a dead raw.
+                    view.warps.clear_dest(WarpDest::Static);
                     if !view.live.is_live() {
                         view.glass = None;
                     }
@@ -1728,14 +1794,23 @@ fn request_warp(
         return;
     }
     self.warps.mark_started(&request);
+    self.spawn_warp(request, cx);
+}
+
+/// Runs one warp on the background executor. `raw` and `shape` are cloned out
+/// of the request first so the inner block and the completion handler do not
+/// fight over the same move.
+fn spawn_warp(&mut self, request: WarpRequest, cx: &mut Context<Self>) {
     let luma = match request.dest {
         WarpDest::Live => Some(self.glass_luma),
         WarpDest::Static => None,
     };
+    let raw = std::sync::Arc::clone(&request.raw);
+    let shape = request.shape;
     cx.spawn(async move |view, cx| {
         let built = cx
             .background_executor()
-            .spawn(async move { request.raw.warp(request.shape, luma) })
+            .spawn(async move { raw.warp(shape, luma) })
             .await;
         view.update(cx, |view, cx| view.finish_warp(request, built, cx)).ok();
     })
@@ -1787,18 +1862,7 @@ fn start_pending_warp(&mut self, cx: &mut Context<Self>) {
         return;
     };
     self.warps.mark_started(&request);
-    let luma = match request.dest {
-        WarpDest::Live => Some(self.glass_luma),
-        WarpDest::Static => None,
-    };
-    cx.spawn(async move |view, cx| {
-        let built = cx
-            .background_executor()
-            .spawn(async move { request.raw.warp(request.shape, luma) })
-            .await;
-        view.update(cx, |view, cx| view.finish_warp(request, built, cx)).ok();
-    })
-    .detach();
+    self.spawn_warp(request, cx);
 }
 
 /// Re-warps the newest raw whenever only the shape moved — the desktop did
@@ -1824,6 +1888,20 @@ In `arm`'s 32 ms loop, after `if view.poll_live(cx) { cx.notify(); }` add:
 
 ```rust
 view.poll_warp(cx);
+```
+
+Delete the `glass_epoch()` helper — `poll_glass` now bumps the epoch inline, and the old helper would be dead code.
+
+While `Face` reads `self.glass_luma`, `poll_live`'s frame install must keep it fresh (Task 11 replaces this block wholesale):
+
+```rust
+if let Some(frame) = frame {
+    self.glass_luma = frame.luma;
+    self.glass = Some(frame);
+    true
+} else {
+    false
+}
 ```
 
 Update `restore_static_glass`:
@@ -1879,7 +1957,7 @@ git commit -m "feat: re-warp the static glass through a coalescing queue"
     #[test]
     fn crop_spec_carries_shape_geometry_and_image_scale() {
         let spec = crop_spec((100, 0, 420, 360), 2.0, (1920, 1080), card_shape()).unwrap();
-        assert_eq!(spec.factor, 2);
+        assert_eq!(spec.geometry.factor, 2);
         assert!((spec.geometry.image_scale - 1.0).abs() < 1e-6);
         assert!((spec.geometry.stage_width - 210.0).abs() < 1e-4);
         assert_eq!(spec.shape, card_shape());
@@ -1894,6 +1972,48 @@ git commit -m "feat: re-warp the static glass through a coalescing queue"
         let morphed = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
         assert!(!live.update_crop((100, 0, 420, 360), 1.0, morphed));
         assert!(live.update_crop((140, 0, 420, 360), 1.0, morphed));
+    }
+```
+
+The three crop tests from Task 9 move onto `geometry` and the 4-arg `crop_spec` in the same step — they cannot compile against the old signature:
+
+```rust
+    #[test]
+    fn crop_keeps_the_lens_margin() {
+        let spec = crop_spec((100, 0, 420, 360), 1.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(
+            (
+                spec.geometry.left,
+                spec.geometry.top,
+                spec.geometry.right,
+                spec.geometry.bottom
+            ),
+            (52, 0, 568, 408)
+        );
+        assert_eq!(spec.geometry.factor, 1);
+        assert!((spec.geometry.crop.x - -48.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.y - 0.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 516.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.height - 408.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crop_clamps_at_screen_edges() {
+        let left = crop_spec((0, 0, 420, 360), 1.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(left.geometry.left, 0);
+        assert!(left.geometry.crop.x.abs() < 1e-6);
+        assert!(left.geometry.crop.y.abs() < 1e-6);
+        assert!(crop_spec((2000, 0, 420, 360), 1.0, (1920, 1080), card_shape()).is_none());
+    }
+
+    #[test]
+    fn crop_is_a_whole_number_of_blocks() {
+        let spec = crop_spec((90, 0, 1260, 1080), 3.0, (1920, 1080), card_shape()).unwrap();
+        assert_eq!(spec.geometry.factor, 3);
+        assert_eq!((spec.geometry.right - spec.geometry.left) % 3, 0);
+        assert_eq!((spec.geometry.bottom - spec.geometry.top) % 3, 0);
+        assert!((spec.geometry.crop.x - -30.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 498.0).abs() < 1e-4);
     }
 ```
 
@@ -2043,13 +2163,22 @@ pub(crate) fn take_frame(&mut self, now_ms: u64) -> (Option<Frame>, Action) {
 
 - [ ] **Step 4: Consume `Frame` in `poll_live`**
 
-In `poll_live`, replace the `update_crop` call and the frame install:
+In `poll_live`, replace the `update_crop` call — the stale-raw drop happens immediately, before any `poll_warp` tick can pick it up:
 
 ```rust
 let shape = GlassShape::from(self.shown.shape.get());
-let mut geometry_changed = false;
 if let Some((x, y, width, height, scale)) = placed_stage(cx) {
-    geometry_changed = self.live.update_crop((x, y, width, height), scale, shape);
+    if self.live.update_crop((x, y, width, height), scale, shape) {
+        // Stale geometry cannot be re-warped: fall back to the wash until a
+        // frame with the new crop arrives. Clearing `static_glass` too lets
+        // the 2s poll rebuild the fallback for the new rect (poll_glass
+        // early-returns while live && static_glass.is_some()).
+        self.last_live_raw = None;
+        self.live_generation = 0;
+        self.glass = None;
+        self.static_glass = None;
+        self.warps.clear_dest(WarpDest::Live);
+    }
 }
 ```
 
@@ -2060,16 +2189,11 @@ let (frame, action) = self.live.take_frame(now);
 self.apply_live(action, cx);
 let mut changed = false;
 if let Some(frame) = frame {
-    if geometry_changed {
-        // Stale geometry cannot be re-warped; fall back to the wash until a
-        // frame with the new crop arrives. The 2s poll rebuilds the static
-        // fallback for the new rect.
-        self.last_live_raw = None;
-        self.live_generation = 0;
-        self.glass = None;
-    }
     self.live_generation = frame.generation;
     self.last_live_raw = Some(frame.raw);
+    if self.glass_luma != frame.luma {
+        changed = true; // the scrim follows the smoothed luma
+    }
     self.glass_luma = frame.luma;
     if let Some(warped) = frame.warped {
         self.glass = Some(warped);
@@ -2106,7 +2230,22 @@ git commit -m "feat: warp live glass frames at capture time"
 **Files:**
 - Modify: `src/island_view/mod.rs`
 
-- [ ] **Step 1: Activate the live branch of `poll_warp`**
+- [ ] **Step 1: Install live re-warps in `finish_warp`**
+
+Task 10's `finish_warp` still has the `_ => {}` arm. Replace it with the Live arm — without it, shape-only re-warps would install nothing, `glass.shape` would never match, and `poll_warp` would re-request the same identity forever:
+
+```rust
+                    WarpDest::Live
+                        if self.live.is_live()
+                            && request.generation == self.live_generation =>
+                    {
+                        self.glass_luma = backdrop.luma;
+                        self.glass = Some(std::sync::Arc::new(backdrop));
+                        cx.notify();
+                    }
+```
+
+- [ ] **Step 2: Activate the live branch of `poll_warp`**
 
 Replace the early return in `poll_warp`:
 
@@ -2138,17 +2277,19 @@ fn poll_warp(&mut self, cx: &mut Context<Self>) {
 }
 ```
 
-- [ ] **Step 2: Verify the queue rules still hold**
+- [ ] **Step 3: Verify the queue rules still hold**
 
 Run: `cargo test warp_queue`
 Expected: PASS (unchanged).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add src/island_view/mod.rs
 git commit -m "feat: re-warp live glass when only the shape changed"
 ```
+
+Coverage note: the queue's identity rules (duplicate skip, superseded ticket, failed marker) are unit-tested in `warp_queue.rs`; `finish_warp`'s dest/generation guards run on the GPUI thread and are covered by those tests plus the manual checklist in Task 14. Extracting them into a pure helper would split the install rules from the state they guard, so the plan accepts the gap deliberately.
 
 ### Task 13: Docs, cleanup, full verification
 

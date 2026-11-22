@@ -311,7 +311,7 @@ static_generation: u64,
 - 静态安装：`build_raw` 后先赋 `raw.generation = epoch`，再请求 Static warp；completion 能通过 `generation == static_generation` 安装（回归 generation 永远为 0 的 bug）。
 - `CropSpec`：shape 变化只更新 shape，geometry 不变时 `update_crop` 返回 `false`；`image_scale = scale/factor`；`stage_width` 正确；`CropSpec::EMPTY` 字段完整。
 - `GlassShape::from(Morph)`：只取 `width/height/radius`。
-- warp 队列：Live 帧安装后，一个 Static completion 不覆盖 `glass`；Live completion 在更新帧到达后按 generation 丢弃；失败 completion 清 `warp_in_flight` 并启动 pending；warp 超过 32ms 时重复 `poll_warp` 不 bump ticket，在飞结果仍能安装。
+- warp 队列：Live 帧安装后，一个 Static completion 不覆盖 `glass`；Live completion 在更新帧到达后按 generation 丢弃；失败 completion 清 `warp_in_flight` 并启动 pending；warp 超过 32ms 时重复 `poll_warp` 不 bump ticket，在飞结果仍能安装。identity 规则由队列单测覆盖；`finish_warp` 的 dest/generation 守卫在 GPUI 线程，由队列测试加手动清单覆盖，不抽纯函数。
 - 几何变化：`update_crop` 返回 `true` 时清 `glass` 回退 wash；旧 `static_glass` 不被当作正确回退；下一次 2s 指纹轮询负责新 rect 的重建，不在 32ms tick 里反复触发。
 - 失败路径：`build_raw` 失败清 `static_raw`/`static_glass`；warp 失败保留旧图、记 `warp_failed`，同一 `(generation, shape, dest)` 不再被 32ms 轮询重试，raw/shape 变化后恢复。
 - `luma`：Live 重 warp 使用当前平滑值，不回退到 raw luma；`warped == None` 时 `Frame.luma` 仍更新 `glass_luma`。
