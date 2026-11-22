@@ -36,6 +36,9 @@
 /// The wallpaper backdrop the liquid glass bends.
 mod wallpaper;
 
+/// The pure refraction math the backdrop is warped with.
+mod glass_optics;
+
 mod island_view;
 mod live_glass;
 mod perf_view;
