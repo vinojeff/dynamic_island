@@ -116,6 +116,14 @@ pub fn sdf_normal(p: (f32, f32), half: (f32, f32), radius: f32) -> Option<(f32, 
     }
 }
 
+/// Bevel band width for one shape, in logical pixels. Grows with the shorter
+/// side, clamps to a usable band, and never crosses the midline.
+#[must_use]
+pub fn bevel_width(shape: GlassShape) -> f32 {
+    let min = shape.width.min(shape.height);
+    (min * 0.18).clamp(10.0, 36.0).min(min / 2.0)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
@@ -190,5 +198,17 @@ mod tests {
     fn a_thin_capsule_medial_axis_has_no_normal() {
         let half = (160.0, 6.0);
         assert!(sdf_normal((0.0, 0.0), half, 6.0).is_none());
+    }
+
+    #[test]
+    fn bevel_clamps_by_shape_size() {
+        let card = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
+        near(bevel_width(card), 36.0);
+        let capsule = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
+        assert!((bevel_width(capsule) - 10.08).abs() < 1e-3);
+        let thin = GlassShape { width: 100.0, height: 12.0, radius: 6.0 };
+        near(bevel_width(thin), 6.0);
+        let tiny = GlassShape { width: 8.0, height: 8.0, radius: 4.0 };
+        near(bevel_width(tiny), 4.0);
     }
 }
