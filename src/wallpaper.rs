@@ -29,6 +29,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETDESKWALLPAPER, SystemParametersInfoW,
 };
 
+use crate::glass_optics::Rect;
+
 /// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
 pub const SATURATION: f32 = 1.15;
 
@@ -75,7 +77,8 @@ impl WallpaperPosition {
 /// How much wallpaper the crop keeps around the stage, logical pixels.
 ///
 /// The edge lens samples the desktop *outside* the panel; the margin is the
-/// distance it can reach. Must exceed the lens pull in `island_view::glass`.
+/// distance it can reach. Must exceed the warp's maximal reach
+/// (`0.8 * 36 * 1.3 + dispersion ≈ 38.6`).
 pub const REFRACTION_MARGIN: f32 = 40.0;
 
 /// A wallpaper crop ready to bend. Built on the background executor and
@@ -91,6 +94,30 @@ pub struct GlassBackdrop {
     /// Zero on a side where the stage touches a display edge, so the lens
     /// knows it cannot sample past the screen.
     pub pad: (f32, f32, f32, f32),
+}
+
+/// A decoded, saturated wallpaper crop that has not been refracted yet.
+///
+/// The view keeps the newest one around so a shape change can re-warp
+/// without touching the wallpaper again. Built on the background executor
+/// only: a full decode costs hundreds of milliseconds.
+pub struct RawGlass {
+    /// Saturated RGBA pixels, `width * height * 4`.
+    pub rgba: Vec<u8>,
+    /// Crop width in image pixels.
+    pub width: usize,
+    /// Crop height in image pixels.
+    pub height: usize,
+    /// Crop rect in logical pixels relative to the window's top-left.
+    pub crop: Rect,
+    /// Image pixels per logical pixel: `scale` static, `scale / factor` live.
+    pub image_scale: f32,
+    /// Unclipped stage width in logical pixels, for centering the shell.
+    pub stage_width: f32,
+    /// Mean lightness of the crop, 0.0 dark .. 1.0 bright.
+    pub luma: f32,
+    /// Bumped per static build and per captured live frame.
+    pub generation: u64,
 }
 
 /// What makes the crop stale: the wallpaper file AND the stage rect.
@@ -298,6 +325,80 @@ pub fn build(
     })
 }
 
+/// Decodes the wallpaper and crops the stage plus a lens margin, without
+/// refracting anything.
+///
+/// [`build_raw`] is the same pipeline as [`build`] but stops at the raw
+/// RGBA crop so the view can re-warp it for whatever shape is current.
+/// Like [`build`], it runs on the background executor only and yields `None`
+/// on any failure; the caller still records the fingerprint. The returned
+/// `generation` is 0 — the caller stamps its own before use.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to the u32 screen bounds"
+)]
+pub fn build_raw(
+    display: (u32, u32),
+    rect: (i32, i32, u32, u32),
+    scale: f32,
+) -> Option<RawGlass> {
+    let fingerprint = fingerprint_now(rect)?;
+    if display.0 == 0 || display.1 == 0 || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let bytes = std::fs::read(&fingerprint.path).ok()?;
+    let wall = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?
+        .to_rgba8();
+    // Draw the wallpaper the way Windows does, then crop the stage *plus* a
+    // margin out of that display-sized canvas. The warp reads the margin to
+    // bend the desktop outside the panel into the rim.
+    let composed = compose(&wall, display, fingerprint.position);
+    let (sx, sy, sw, sh) = stage_crop((composed.width(), composed.height()), rect)?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "inputs are 0..=255 and every result clamps to that range \
+                  before the narrowing cast"
+    )]
+    let margin = (REFRACTION_MARGIN * scale).round().max(0.0) as u32;
+    let left = sx.saturating_sub(margin);
+    let top = sy.saturating_sub(margin);
+    let right = (sx + sw + margin).min(composed.width());
+    let bottom = (sy + sh + margin).min(composed.height());
+    let w = right.saturating_sub(left);
+    let h = bottom.saturating_sub(top);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut crop_raw = image::imageops::crop_imm(&composed, left, top, w, h)
+        .to_image()
+        .into_raw();
+    let cw = w as usize;
+    let ch = h as usize;
+    saturate(&mut crop_raw, SATURATION);
+    let luma = mean_luma(&crop_raw);
+    let crop = crop_rect(left, top, right, bottom, (rect.0, rect.1), scale);
+    #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
+    let stage_width = rect.2 as f32 / scale;
+    Some(RawGlass {
+        rgba: crop_raw,
+        width: cw,
+        height: ch,
+        crop,
+        image_scale: scale,
+        stage_width,
+        luma,
+        generation: 0,
+    })
+}
+
 /// Draws the wallpaper into a display-sized canvas using the Windows placement.
 ///
 /// `Fill`, `Span`, and `Stretch` cover every pixel; `Fit` and `Center` leave
@@ -398,6 +499,32 @@ pub fn stage_crop(
         return None;
     }
     Some((x, y, width, height))
+}
+
+/// The crop rect in logical pixels relative to the window's top-left.
+///
+/// `left/top/right/bottom` are the physical crop bounds and `stage` is the
+/// window's physical origin. x/y are negative while the crop reaches past the
+/// window, and turn positive once the window hangs off the screen.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel counts are far under f32's 24-bit mantissa"
+)]
+pub(crate) fn crop_rect(
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    stage: (i32, i32),
+    scale: f32,
+) -> Rect {
+    Rect {
+        x: (left as f32 - stage.0 as f32) / scale,
+        y: (top as f32 - stage.1 as f32) / scale,
+        width: (right - left) as f32 / scale,
+        height: (bottom - top) as f32 / scale,
+    }
 }
 
 /// Scales RGB saturation by `factor` around each pixel's luma, clamped.
@@ -719,5 +846,17 @@ mod tests {
         assert!(render_image_rgba(0, 1, &[]).is_none());
         assert!(render_image_rgba(1, 0, &[]).is_none());
         assert!(render_image_rgba(1, 1, &[1, 2, 3, 4]).is_some());
+    }
+
+    #[test]
+    fn the_crop_rect_is_signed_relative_to_the_window() {
+        let r = crop_rect(52, 0, 568, 408, (100, 0), 1.0);
+        assert!((r.x - -48.0).abs() < 1e-4);
+        assert!((r.y - 0.0).abs() < 1e-4);
+        assert!((r.width - 516.0).abs() < 1e-4);
+        assert!((r.height - 408.0).abs() < 1e-4);
+        // A window hanging 10 px off the left edge: the crop starts right of it.
+        let r = crop_rect(0, 0, 458, 408, (-10, 0), 1.0);
+        assert!((r.x - 10.0).abs() < 1e-4);
     }
 }
