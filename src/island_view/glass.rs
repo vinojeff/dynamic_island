@@ -58,9 +58,13 @@ const RIM_BANDS: usize = 3;
 
 /// The milky veil a luma calls for. A dark wallpaper needs more milk so the
 /// dark ink stays readable; a bright wallpaper needs less so its color shows.
+///
+/// The face is now a sharp crop with a thin bent band, so the old 0.16..0.26
+/// veil read as fog over a clear image; these values keep only a tint. If
+/// dark ink ever struggles on a dark wallpaper, raise the clamp floor first.
 #[must_use]
 pub(super) fn veil_alpha(luma: f32) -> f32 {
-    (0.26 - 0.10 * luma).clamp(0.16, 0.26)
+    (0.15 - 0.09 * luma).clamp(0.06, 0.15)
 }
 
 /// Rim brightness by band: brightest flush against the edge, falling off
@@ -240,7 +244,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
     let shape = div().absolute().inset_0().rounded(px(radius));
     let scrim = if seeded {
         let top = veil_alpha(luma);
-        let bottom = (top + 0.06).min(0.32);
+        let bottom = (top + 0.04).min(0.21);
         shape.bg(linear_gradient(
             180.0,
             linear_color_stop(hsla(GLASS_HUE, 0.14, 0.98, top), 0.0),
@@ -263,7 +267,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .rounded(px(radius))
         .bg(linear_gradient(
             SPECULAR_ANGLE,
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.12), 0.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.07), 0.0),
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
         ));
     let sheen_low = div()
@@ -273,7 +277,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .bg(linear_gradient(
             SPECULAR_ANGLE,
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.05), 1.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.03), 1.0),
         ));
     // Same auto-size trap as the lens: without `size_full` the canvas is
     // zero-high and every `paint_ring` band fails its size guard.
@@ -434,12 +438,12 @@ mod tests {
 
     #[test]
     fn veil_thickens_on_a_dark_wallpaper_and_thins_on_a_bright_one() {
-        assert_eq!(veil_alpha(0.0), 0.26, "dark wallpaper → more milk");
-        assert_eq!(veil_alpha(1.0), 0.16, "bright wallpaper → less milk");
+        assert_eq!(veil_alpha(0.0), 0.15, "dark wallpaper → more milk");
+        assert_eq!(veil_alpha(1.0), 0.06, "bright wallpaper → less milk");
         let mut luma = 0.0;
         while luma <= 1.0 {
             assert!(
-                (0.16..=0.26).contains(&veil_alpha(luma)),
+                (0.06..=0.15).contains(&veil_alpha(luma)),
                 "luma {luma} escapes the clamp"
             );
             luma += 0.05;
