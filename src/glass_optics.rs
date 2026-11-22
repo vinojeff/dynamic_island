@@ -206,6 +206,10 @@ pub fn bend_lut() -> [f32; BEND_STEPS] {
     lut[0] = 1.0;
     let mut remaining = 1.0;
     for step in 1..BEND_STEPS {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "BEND_STEPS is 64; the conversions are exact in f32"
+        )]
         let e = (step as f32 - 0.5) * dt;
         // raw_bend decreases inward, so the drop between the neighbours is
         // the positive quantity. Beyond the cap the profile rides the cap
@@ -218,7 +222,11 @@ pub fn bend_lut() -> [f32; BEND_STEPS] {
         )]
         let steps_left = (BEND_STEPS - step) as f32;
         let descent = (raw_drop.max(remaining / steps_left)).min(max_lut_step);
-        lut[step] = (lut[step - 1] - descent).max(0.0);
+        let previous = lut.get(step - 1).copied().unwrap_or(1.0);
+        let value = (previous - descent).max(0.0);
+        if let Some(slot) = lut.get_mut(step) {
+            *slot = value;
+        }
         remaining = (remaining - descent).max(0.0);
     }
     lut
@@ -241,7 +249,7 @@ pub fn displacement(
     bevel_px: f32,
     margins: Margins,
 ) -> Option<(f32, f32)> {
-    if !(bevel_px > 0.0) {
+    if bevel_px <= 0.0 || bevel_px.is_nan() {
         return None;
     }
     let center = shell.center();
@@ -266,14 +274,13 @@ pub fn displacement(
         clippy::cast_sign_loss,
         reason = "e is clamped to 0..=1 and BEND_STEPS is 64"
     )]
-    let x = e_of(d, bevel_px) * (BEND_STEPS - 1) as f32;
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "x is clamped to 0..=BEND_STEPS-1"
-    )]
-    let index = x.floor() as usize;
-    let t = x - index as f32;
+    let index = {
+        let x = e_of(d, bevel_px) * (BEND_STEPS - 1) as f32;
+        let index = x.floor() as usize;
+        let t = x - index as f32;
+        (index, t)
+    };
+    let (index, t) = index;
     let low = lut.get(index).copied().unwrap_or(0.0);
     let high = lut.get(index + 1).copied().unwrap_or(low);
     let depth = DEPTH_FACTOR * bevel_px;
@@ -355,7 +362,7 @@ pub fn warp(
         return None;
     }
     let mut out = src.to_vec();
-    if !(bevel_px > 0.0) {
+    if bevel_px <= 0.0 || bevel_px.is_nan() {
         return Some(out);
     }
     let margins = Margins {
@@ -418,10 +425,11 @@ fn sample_bilinear(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [
         ]
     };
     let (tl, tr, bl, br) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let corners = tl.iter().zip(tr.iter()).zip(bl.iter().zip(br.iter()));
     let mut out = [0u8; 4];
-    for (slot, i) in out.iter_mut().zip(0..4) {
-        let top = tl[i] + (tr[i] - tl[i]) * fx;
-        let bottom = bl[i] + (br[i] - bl[i]) * fx;
+    for (slot, ((&tl, &tr), (&bl, &br))) in out.iter_mut().zip(corners) {
+        let top = tl + (tr - tl) * fx;
+        let bottom = bl + (br - bl) * fx;
         let value = top + (bottom - top) * fy;
         *slot = value.round().clamp(0.0, 255.0) as u8;
     }
@@ -528,10 +536,12 @@ mod tests {
     #[test]
     fn bend_runs_from_one_to_zero_and_falls_monotonically() {
         let lut = bend_lut();
-        near(lut[0], 1.0);
-        near(lut[63], 0.0);
+        near(lut.first().copied().unwrap(), 1.0);
+        near(lut.last().copied().unwrap(), 0.0);
         for pair in lut.windows(2) {
-            assert!(pair[0] >= pair[1], "bend must not grow inward: {pair:?}");
+            if let [a, b] = pair {
+                assert!(a >= b, "bend must not grow inward: {a} -> {b}");
+            }
         }
     }
 
@@ -640,6 +650,10 @@ mod tests {
         let mut prev =
             displacement(&lut, (shell.x + 210.0, shell.y), shell, 36.0, even_margins()).unwrap();
         for row in 1..=12 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "row is 1..=12; the conversion is exact"
+            )]
             let p = (shell.x + 210.0, shell.y + 0.5 * row as f32);
             let cur = displacement(&lut, p, shell, 36.0, even_margins()).unwrap();
             let step = ((cur.0 - prev.0).abs() + (cur.1 - prev.1).abs()).sqrt();

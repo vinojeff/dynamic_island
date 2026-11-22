@@ -22,7 +22,7 @@ use gpui_kit::{
     div, hsla, linear_color_stop, linear_gradient, point, px, size,
 };
 
-use rustedge::island::{self, IslandState};
+use rustedge::island;
 
 use crate::glass_optics::{self, GlassShape, Rect};
 use crate::wallpaper;
@@ -32,6 +32,16 @@ use crate::wallpaper;
 /// Three bands wide: a bright edge decomposing inward, which is what makes
 /// the silhouette read as a lens rather than a colored rectangle.
 pub(super) const REFRACTION_WIDTH: f32 = 4.0;
+
+/// How long one backdrop cross-fades into the next after a re-warp lands.
+pub(super) const GLASS_FADE_MS: u64 = 120;
+
+/// Below this shell height the wallpaper lens is fully faded out; the line
+/// glass covers the crossing.
+const LENS_FADE_LOW: f32 = 7.0;
+
+/// Above this shell height the wallpaper lens is fully opaque.
+const LENS_FADE_HIGH: f32 = 13.0;
 
 /// Diagonal direction of the specular streak, degrees clockwise from top.
 pub(super) const SPECULAR_ANGLE: f32 = 130.0;
@@ -98,39 +108,80 @@ pub(super) fn shell_shadows() -> Vec<BoxShadow> {
     ]
 }
 
+/// 0.0 → 1.0 across [`GLASS_FADE_MS`] of elapsed time.
+#[must_use]
+pub(crate) fn fade_progress(elapsed_ms: u64) -> f32 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "milliseconds fit in f32 for this use"
+    )]
+    (elapsed_ms as f32 / GLASS_FADE_MS as f32).clamp(0.0, 1.0)
+}
+
+/// The lens fades out as the island collapses into the line: the neon line
+/// glass takes over below [`LENS_FADE_HIGH`] and the wallpaper lens is gone
+/// by [`LENS_FADE_LOW`], so the mode switch stops being a hard cut.
+#[must_use]
+fn lens_opacity_for_height(height: f32) -> f32 {
+    ((height - LENS_FADE_LOW) / (LENS_FADE_HIGH - LENS_FADE_LOW)).clamp(0.0, 1.0)
+}
+
 /// The refracted wallpaper under the shell, painted once at the root.
 ///
 /// The crop is warped on the producer side (`RawGlass::warp`); this only
-/// clips the shell out of the crop's natural rect. Empty when tucked as the
-/// line or before the first build lands — the fallback wash in [`layers`]
-/// takes over.
+/// clips the shell out of the crop's natural rect. `fading` is the previous
+/// backdrop plus the cross-fade progress — the new warp blends over it so a
+/// landing never snaps. Empty when the opacity ramp or the fade says so; the
+/// fallback wash in [`layers`] takes over.
 pub(super) fn lens(
     shape: island::Morph,
-    state: IslandState,
     backdrop: Option<&Arc<wallpaper::GlassBackdrop>>,
+    fading: Option<(&Arc<wallpaper::GlassBackdrop>, f32)>,
 ) -> gpui_kit::Div {
-    let base = div().absolute().inset_0();
-    // `chrome::paint` hands the tucked line to `line_glass` below 12px, so the
-    // lens must not paint a wallpaper sliver under it during the tuck morph.
-    if state == IslandState::Line || shape.height < 12.0 {
-        return base;
+    let height_opacity = lens_opacity_for_height(shape.height);
+    // `chrome::paint` hands the tucked line to `line_glass`, which paints
+    // *over* the lens through the fade band below; fully tucked (height 6)
+    // the opacity is zero and nothing paints.
+    if height_opacity <= 0.0 {
+        return div().absolute().inset_0();
+    }
+    let mut base = div().absolute().inset_0().opacity(height_opacity);
+    let (fading_backdrop, t) = match fading {
+        Some((old, t)) if t < 1.0 => (Some(Arc::clone(old)), t),
+        _ => (None, 1.0),
+    };
+    if let Some(old) = fading_backdrop {
+        // Old under, new over: a proper cross-fade instead of a hard swap.
+        base = base.child(lens_canvas(old, shape, 1.0 - t));
     }
     let Some(backdrop) = backdrop else {
         return base;
     };
-    let backdrop = Arc::clone(backdrop);
-    // `canvas()` defaults to an auto-sized box: in this block parent its
-    // height collapses to zero and `paint_image` bails on an empty rect.
+    base.child(lens_canvas(Arc::clone(backdrop), shape, t))
+}
+
+/// One opacity-wrapped canvas painting `backdrop` mapped onto `shape`.
+fn lens_canvas(
+    backdrop: Arc<wallpaper::GlassBackdrop>,
+    shape: island::Morph,
+    opacity: f32,
+) -> gpui_kit::Div {
+    // `canvas()` defaults to an auto-sized box: in a block parent its height
+    // collapses to zero and `paint_image` bails on an empty rect.
     // `size_full` is load-bearing, not decoration.
-    base.child(
-        canvas(
-            |_, _, _| (),
-            move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-                paint_backdrop(bounds, shape, &backdrop, window);
-            },
+    div()
+        .absolute()
+        .inset_0()
+        .opacity(opacity)
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
+                    paint_backdrop(bounds, shape, &backdrop, window);
+                },
+            )
+            .size_full(),
         )
-        .size_full(),
-    )
 }
 
 /// One clipped draw: the current shell out of the (possibly stale-scaled)
@@ -364,7 +415,7 @@ mod tests {
 
     use gpui_kit::{IntoElement, ParentElement, Styled, div, point, px, size};
 
-    use rustedge::island::{CARD_HEIGHT, CARD_RADIUS, CARD_WIDTH, STAGE_HEIGHT, STAGE_WIDTH};
+    use rustedge::island::{IslandState, CARD_HEIGHT, CARD_RADIUS, CARD_WIDTH, STAGE_HEIGHT, STAGE_WIDTH};
 
     use super::*;
 
@@ -402,6 +453,32 @@ mod tests {
         assert_eq!(rim_alpha(RIM_BANDS), 0.0, "beyond the rim: nothing");
     }
 
+    #[test]
+    fn fade_progress_runs_zero_to_one_across_the_window() {
+        assert_eq!(fade_progress(0), 0.0);
+        assert_eq!(fade_progress(GLASS_FADE_MS), 1.0);
+        assert_eq!(fade_progress(GLASS_FADE_MS * 10), 1.0, "clamped past the end");
+        let half = fade_progress(GLASS_FADE_MS / 2);
+        assert!(half > 0.4 && half < 0.6);
+        let mut t = 0.0;
+        while t <= GLASS_FADE_MS as f32 {
+            let next = fade_progress(t as u64 + 10);
+            assert!(next >= t / GLASS_FADE_MS as f32, "fade must not go backwards");
+            t += 10.0;
+        }
+    }
+
+    #[test]
+    fn lens_opacity_fades_out_across_the_line_crossing() {
+        assert_eq!(lens_opacity_for_height(6.0), 0.0, "tucked line: no lens");
+        assert_eq!(lens_opacity_for_height(7.0), 0.0);
+        assert_eq!(lens_opacity_for_height(13.0), 1.0);
+        assert_eq!(lens_opacity_for_height(56.0), 1.0, "capsule: full lens");
+        let mid = lens_opacity_for_height(10.0);
+        assert!(mid > 0.3 && mid < 0.7, "the crossing blends, not cuts");
+        assert!(lens_opacity_for_height(9.0) < lens_opacity_for_height(11.0));
+    }
+
     /// The lens is painted from a canvas. A bare `canvas()` has an auto
     /// height in a block parent and collapses to zero, which makes
     /// `paint_image` bail on its empty visible rect: the lens silently never
@@ -411,12 +488,8 @@ mod tests {
         let measured = Rc::new(Cell::new((0.0f32, 0.0f32)));
         let image = backdrop();
         let slot = Rc::clone(&measured);
-        let lens = super::lens(
-            island::resting(IslandState::Card),
-            IslandState::Card,
-            Some(&image),
-        )
-        .on_children_prepainted(move |children, _, _| {
+        let lens = super::lens(island::resting(IslandState::Card), Some(&image), None)
+            .on_children_prepainted(move |children, _, _| {
             if let Some(bounds) = children.last() {
                 slot.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
             }

@@ -198,6 +198,8 @@ pub struct IslandView {
     last_live_raw: Option<std::sync::Arc<wallpaper::RawGlass>>,
     /// The generation `last_live_raw` was captured under. `MAX` means none.
     live_generation: u64,
+    /// The previous backdrop, cross-faded out after a warp lands.
+    fading_glass: Option<(std::sync::Arc<wallpaper::GlassBackdrop>, u64)>,
     /// Pending, in-flight, and failed glass warps. Install rules live in
     /// [`Self::finish_warp`].
     warps: WarpQueue,
@@ -273,6 +275,7 @@ impl IslandView {
             glass_luma: glass::IDLE_LUMA,
             last_live_raw: None,
             live_generation: u64::MAX,
+            fading_glass: None,
             warps: WarpQueue::default(),
             live: live_glass::LiveGlass::new(),
             static_glass: None,
@@ -389,6 +392,9 @@ impl IslandView {
                             cx.notify();
                         }
                         view.poll_warp(cx);
+                        if view.tick_glass_fade() {
+                            cx.notify();
+                        }
                         if view.state == IslandState::Capsule {
                             cx.notify();
                         }
@@ -627,6 +633,9 @@ impl IslandView {
                     install = Some(backdrop);
                 }
                 if let Some(backdrop) = install {
+                    // Cross-fade from whatever is on screen; a fade-in from
+                    // nothing covers the first crop replacing the wash.
+                    self.fading_glass = self.glass.take().map(|old| (old, millis_now()));
                     self.glass_luma = backdrop.luma;
                     self.glass = Some(Arc::new(backdrop));
                     cx.notify();
@@ -649,6 +658,19 @@ impl IslandView {
         };
         self.warps.mark_started(&request);
         self.spawn_warp(request, cx);
+    }
+
+    /// Expires a finished glass fade. Returns `true` while a fade is running
+    /// (including the tick that expires it, so the last full-opacity frame
+    /// renders), which keeps the loop repainting until it settles.
+    fn tick_glass_fade(&mut self) -> bool {
+        let Some((_, start)) = self.fading_glass else {
+            return false;
+        };
+        if millis_now().saturating_sub(start) >= glass::GLASS_FADE_MS {
+            self.fading_glass = None;
+        }
+        true
     }
 
     /// Re-warps the newest raw whenever only the shape moved — the desktop
@@ -718,6 +740,7 @@ impl IslandView {
             self.live_on = true;
             self.glass_epoch = self.glass_epoch.saturating_add(1);
             self.glass_building = false;
+            self.fading_glass = None;
             self.warps.clear_pending();
             cx.notify();
             return;
@@ -733,6 +756,8 @@ impl IslandView {
     /// Idempotent enough to run on any transition out of live ownership: the
     /// installed crop is rebuilt once because the fingerprint is cleared.
     fn restore_static_glass(&mut self) {
+        // Fade the live image out rather than snapping to the wallpaper.
+        self.fading_glass = self.glass.take().map(|old| (old, millis_now()));
         self.glass = self.static_glass.clone();
         self.glass_luma = self
             .static_glass
@@ -875,6 +900,9 @@ impl IslandView {
             }
             self.glass_luma = frame.luma;
             if let Some(warped) = frame.warped {
+                // A fresh live frame supersedes any running fade: blending
+                // video frames 120ms apart would ghost the desktop.
+                self.fading_glass = None;
                 self.glass = Some(warped);
                 changed = true;
             }
@@ -1320,6 +1348,12 @@ impl IslandView {
             view.drag_origin = None;
             view.window_origin = None;
         });
+        // The lens paints first so the shell sits on top of it. A landed warp
+        // cross-fades over the previous backdrop instead of snapping.
+        let fading = self.fading_glass.as_ref().map(|(old, start)| {
+            (Arc::clone(old), glass::fade_progress(millis_now().saturating_sub(*start)))
+        });
+        let fading = fading.as_ref().map(|(old, t)| (old, *t));
 
         div()
             .size_full()
@@ -1336,11 +1370,7 @@ impl IslandView {
                 view.on_arrow(event, cx);
             }))
             // The lens paints first so the shell sits on top of it.
-            .child(glass::lens(
-                lens_shape,
-                self.state,
-                self.glass.as_ref(),
-            ))
+            .child(glass::lens(lens_shape, self.glass.as_ref(), fading))
             .child(island)
     }
 }
