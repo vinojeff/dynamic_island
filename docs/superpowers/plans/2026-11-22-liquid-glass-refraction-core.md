@@ -44,7 +44,7 @@
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `src/glass_optics.rs` with the module doc, the four types, and an empty `sd_round_rect` stub (`pub fn sd_round_rect(_p: (f32, f32), _half: (f32, f32), _radius: f32) -> f32 { 0.0 }`), plus:
+Create `src/glass_optics.rs` with the module doc, the four types, the `From<rustedge::island::Morph>` impl shown in Step 3, and an empty `sd_round_rect` stub (`pub fn sd_round_rect(_p: (f32, f32), _half: (f32, f32), _radius: f32) -> f32 { 0.0 }`), plus:
 
 ```rust
 #[cfg(test)]
@@ -98,7 +98,7 @@ mod tests {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test glass_optics`
-Expected: both tests FAIL by assertion (the stub returns 0.0).
+Expected: the two SDF tests FAIL by assertion (the stub returns 0.0); the `From<Morph>` test passes already.
 
 - [ ] **Step 3: Implement**
 
@@ -2068,7 +2068,15 @@ impl CropSpec {
 `crop_spec` gains `shape` and computes the new fields (geometry identical to Task 9 plus):
 
 ```rust
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel counts are far under f32's 24-bit mantissa"
+)]
 let image_scale = scale / factor as f32;
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel counts are far under f32's 24-bit mantissa"
+)]
 let stage_width = stage.2 as f32 / scale;
 Some(CropSpec {
     geometry: CropGeometry { left, top, right, bottom, factor, crop, image_scale, stage_width },
@@ -2172,9 +2180,11 @@ if let Some((x, y, width, height, scale)) = placed_stage(cx) {
         // Stale geometry cannot be re-warped: fall back to the wash until a
         // frame with the new crop arrives. Clearing `static_glass` too lets
         // the 2s poll rebuild the fallback for the new rect (poll_glass
-        // early-returns while live && static_glass.is_some()).
+        // early-returns while live && static_glass.is_some()). MAX never
+        // matches a sink generation, so an in-flight re-warp of the old
+        // geometry is dropped instead of installed.
         self.last_live_raw = None;
-        self.live_generation = 0;
+        self.live_generation = u64::MAX;
         self.glass = None;
         self.static_glass = None;
         self.warps.clear_dest(WarpDest::Live);
@@ -2191,7 +2201,7 @@ let mut changed = false;
 if let Some(frame) = frame {
     self.live_generation = frame.generation;
     self.last_live_raw = Some(frame.raw);
-    if self.glass_luma != frame.luma {
+    if (self.glass_luma - frame.luma).abs() > f32::EPSILON {
         changed = true; // the scrim follows the smoothed luma
     }
     self.glass_luma = frame.luma;
@@ -2203,11 +2213,11 @@ if let Some(frame) = frame {
 changed
 ```
 
-Add the fields `last_live_raw: Option<std::sync::Arc<wallpaper::RawGlass>>` and `live_generation: u64` to `IslandView` (default `None`/`0`), and extend `restore_static_glass` with:
+Add the fields `last_live_raw: Option<std::sync::Arc<wallpaper::RawGlass>>` and `live_generation: u64` to `IslandView` (default `None`/`u64::MAX` — no live frame yet, and MAX never collides with a sink generation), and extend `restore_static_glass` with:
 
 ```rust
 self.last_live_raw = None;
-self.live_generation = 0;
+self.live_generation = u64::MAX;
 ```
 
 - [ ] **Step 5: Run everything**
@@ -2232,7 +2242,7 @@ git commit -m "feat: warp live glass frames at capture time"
 
 - [ ] **Step 1: Install live re-warps in `finish_warp`**
 
-Task 10's `finish_warp` still has the `_ => {}` arm. Replace it with the Live arm — without it, shape-only re-warps would install nothing, `glass.shape` would never match, and `poll_warp` would re-request the same identity forever:
+Task 10's `finish_warp` still has the `_ => {}` arm. Add the Live arm **before** it and keep the wildcard — the two guarded arms alone don't exhaust the match (E0005), and stale completions must fall through to nothing. Without the Live arm, shape-only re-warps would install nothing, `glass.shape` would never match, and `poll_warp` would re-request the same identity forever:
 
 ```rust
                     WarpDest::Live
@@ -2243,6 +2253,9 @@ Task 10's `finish_warp` still has the `_ => {}` arm. Replace it with the Live ar
                         self.glass = Some(std::sync::Arc::new(backdrop));
                         cx.notify();
                     }
+                    // Stale or blocked completions install nothing.
+                    _ => {}
+                }
 ```
 
 - [ ] **Step 2: Activate the live branch of `poll_warp`**
