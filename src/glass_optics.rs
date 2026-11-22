@@ -290,6 +290,102 @@ pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect)
     }
 }
 
+/// Fraction of the bend used to spread R/G/B sample positions.
+pub const DISPERSION: f32 = 0.03;
+
+/// One CPU resampling pass: the bevel band is displaced along the SDF
+/// normal, R/G/B sample slightly different positions for dispersion, and
+/// everything else is copied verbatim. Returns `None` when `src` does not
+/// match `width * height * 4`.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel counts are far under f32's 24-bit mantissa"
+)]
+pub fn warp(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    shell: Shell,
+    bevel_px: f32,
+) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || src.len() != width * height * 4 {
+        return None;
+    }
+    let mut out = src.to_vec();
+    if !(bevel_px > 0.0) {
+        return Some(out);
+    }
+    let margins = Margins {
+        left: shell.x.max(0.0),
+        top: shell.y.max(0.0),
+        right: (width as f32 - (shell.x + shell.width)).max(0.0),
+        bottom: (height as f32 - (shell.y + shell.height)).max(0.0),
+    };
+    let lut = bend_lut();
+    for (y, row) in out.chunks_exact_mut(width * 4).enumerate() {
+        for (x, chunk) in row.chunks_exact_mut(4).enumerate() {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            let Some((bx, by)) = displacement(&lut, p, shell, bevel_px, margins) else {
+                continue;
+            };
+            let red =
+                sample_bilinear(src, width, height, p.0 + bx * (1.0 - DISPERSION), p.1 + by * (1.0 - DISPERSION));
+            let green = sample_bilinear(src, width, height, p.0 + bx, p.1 + by);
+            let blue = sample_bilinear(
+                src,
+                width,
+                height,
+                p.0 + bx * (1.0 + DISPERSION),
+                p.1 + by * (1.0 + DISPERSION),
+            );
+            if let [r, g, b, a] = chunk {
+                *r = red[0];
+                *g = green[1];
+                *b = blue[2];
+                *a = green[3];
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Clamped bilinear RGBA sample.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped coordinates index the crop; the result rounds back to 0..=255"
+)]
+fn sample_bilinear(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [u8; 4] {
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let at = |px: usize, py: usize| {
+        let base = (py * width + px) * 4;
+        [
+            f32::from(src.get(base).copied().unwrap_or(0)),
+            f32::from(src.get(base + 1).copied().unwrap_or(0)),
+            f32::from(src.get(base + 2).copied().unwrap_or(0)),
+            f32::from(src.get(base + 3).copied().unwrap_or(0)),
+        ]
+    };
+    let (tl, tr, bl, br) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+    let mut out = [0u8; 4];
+    for (slot, i) in out.iter_mut().zip(0..4) {
+        let top = tl[i] + (tr[i] - tl[i]) * fx;
+        let bottom = bl[i] + (br[i] - bl[i]) * fx;
+        let value = top + (bottom - top) * fy;
+        *slot = value.round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
@@ -554,5 +650,70 @@ mod tests {
         let same = stale_image_bounds(natural, current, current);
         near(same.x, natural.x);
         near(same.width, natural.width);
+    }
+
+    fn solid(width: usize, height: usize, rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for _ in 0..width * height {
+            out.extend_from_slice(&rgba);
+        }
+        out
+    }
+
+    fn pixel(buf: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let base = (y * width + x) * 4;
+        [
+            buf.get(base).copied().unwrap_or(0),
+            buf.get(base + 1).copied().unwrap_or(0),
+            buf.get(base + 2).copied().unwrap_or(0),
+            buf.get(base + 3).copied().unwrap_or(0),
+        ]
+    }
+
+    fn small_shell() -> Shell {
+        Shell { x: 20.0, y: 20.0, width: 60.0, height: 60.0, radius: 10.0 }
+    }
+
+    #[test]
+    fn warp_keeps_the_center_and_the_margin_untouched() {
+        let src = solid(100, 100, [10, 20, 30, 255]);
+        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        assert_eq!(pixel(&out, 100, 50, 50), [10, 20, 30, 255]);
+        assert_eq!(pixel(&out, 100, 2, 2), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn warp_pulls_the_top_edge_from_above() {
+        let mut src = solid(100, 100, [0, 0, 255, 255]);
+        for row in src.chunks_exact_mut(100 * 4).take(20) {
+            for chunk in row.chunks_exact_mut(4) {
+                if let [r, g, b, a] = chunk {
+                    *r = 255;
+                    *g = 0;
+                    *b = 0;
+                    *a = 255;
+                }
+            }
+        }
+        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        let edge = pixel(&out, 100, 50, 20);
+        assert!(edge[0] > 200, "the top edge must sample the red margin: {edge:?}");
+        assert!(edge[2] < 100, "the top edge must not stay blue: {edge:?}");
+    }
+
+    #[test]
+    fn warp_preserves_alpha() {
+        let src = solid(100, 100, [10, 20, 30, 0]);
+        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        assert_eq!(pixel(&out, 100, 50, 50)[3], 0);
+        assert_eq!(pixel(&out, 100, 50, 20)[3], 0);
+    }
+
+    #[test]
+    fn warp_rejects_a_size_mismatch_and_zero_bevel_copies() {
+        assert!(warp(&[0, 0, 0, 0], 2, 2, small_shell(), 4.0).is_none());
+        let src = solid(100, 100, [1, 2, 3, 255]);
+        let out = warp(&src, 100, 100, small_shell(), 0.0).unwrap();
+        assert_eq!(out, src);
     }
 }
