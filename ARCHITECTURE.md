@@ -23,7 +23,7 @@ same arrangement as `SendMessage` back to a window thread).
 ```
 hook thread --ScreenPoint-->  GPUI thread (IslandView)  --VolumeCommand--> volume STA
 tray thread --Command------>       |  <----CropSpec---- WGC thread
-       ^                           |  ---GlassBackdrop--> WGC thread
+       ^                           |  ---LiveFrame------> WGC thread
        |                           |-- media::send / seek --> background executor
        |                           |-- media::current, toasts::poll (1s)
        |                           |-- perf::Sampler::sample (1s, its own loop)
@@ -36,7 +36,7 @@ tray thread --Command------>       |  <----CropSpec---- WGC thread
 | Mouse hook | `PeekMessage` + 30ms sleep | `WH_MOUSE_LL` | `ScreenPoint` over `mpsc` |
 | Tray | `GetMessage` | notify icon, foreground hook, 2s topmost timer | `Command` over `mpsc` |
 | Volume STA | blocking `recv` | `IAudioEndpointVolume`, COM apartment | `Reading` over `mpsc` |
-| WGC capture | `windows-capture` session loop | D3D11 device, frame pool, one monitor item | `Arc<GlassBackdrop>` through the `Sink` slot |
+| WGC capture | `windows-capture` session loop | D3D11 device, frame pool, one monitor item | `LiveFrame { raw, warped }` through the `Sink` slot |
 | Background executor | GPUI pool | one-shot `WinRT` and `sysinfo` calls | results through `view.update` |
 
 The capture thread exists only while an island session is open. `start_session`
@@ -88,7 +88,7 @@ close over the view.
 | `CoverCache` | poll threads | poll threads | `OnceLock<Mutex<_>>`. Init once, then the mutex. |
 | `PerfSample` | background executor | GPUI | one `Copy` value. The `Sampler` itself moves with the task and comes back. |
 | `CropSpec` | GPUI | WGC capture | `Arc<Mutex<_>>` shared with the handler, which copies it once per frame. |
-| `GlassBackdrop` | WGC capture | GPUI | `Arc` left in the `Sink` mutex slot; the view takes at most one per tick. |
+| `GlassBackdrop` | warp queue / WGC capture | GPUI | `Arc` installed by the view's `finish_warp`; live frames carry it pre-warped in `LiveFrame`. |
 
 The hook procedure and the tray window procedure are function pointers, so
 neither can carry a context argument. The hook keeps its `Sender` in a thread
@@ -202,10 +202,12 @@ clears the WDA bit, stops capture, and puts the wallpaper crop back.
 `REFRACTION_MARGIN` logical pixels of lens margin on each side, and picks an
 integer downsampling factor from the DPI scale (`round(scale)`, clamped to
 1..=3). Right and bottom are rounded down to whole blocks so `downsample` has
-no leftovers. `pad` records the logical margin the lens already expects. The
-view updates the spec on every tick while live, even collapsed: the prewarm
-session and the first expand both need a valid rect, and an unchanged spec is
-one comparison.
+no leftovers. The spec carries a signed `crop` rect (logical pixels relative
+to the window's top-left), an image-per-logical scale, and the island shape;
+only a geometry change invalidates the kept raw frame, a shape-only change
+just re-warps it. The view updates the spec on every tick while live, even
+collapsed: the prewarm session and the first expand both need a valid rect,
+and an unchanged spec is one comparison.
 
 **Session.** `Machine` is a pure event machine (`Off`, `Idle`, `Starting`,
 `Running`, `Stopping`) that returns `Start` or `Stop`; the view runs those on
@@ -223,10 +225,12 @@ tear the session down before the cache is filled.
 
 **Frame path.** The handler reads the shared spec, crops the D3D staging
 buffer with `buffer_crop`, box-averages it by the factor, applies the same
-saturation as the wallpaper path, measures mean luma, builds a `RenderImage`,
-and publishes a `GlassBackdrop` into `Sink`. The view takes the newest frame
-only while `Running`, smooths luma with a 200ms time constant, installs it in
-`glass`, and repaints. A frame that lands while `Stopping` is dropped.
+saturation as the wallpaper path, measures mean luma, refracts the crop once
+with `RawGlass::warp` (rounded-rect SDF bevel + Snell, `glass_optics`), and
+publishes a `LiveFrame { raw, warped }` into `Sink`. The view takes the newest
+frame only while `Running`, smooths luma with a 200ms time constant, installs
+`warped` in `glass`, keeps `raw` for shape-only re-warps, and repaints. A
+frame that lands while `Stopping` is dropped.
 
 **Idle cost.** Windows Graphics Capture delivers a frame only when the
 desktop changed, and `MinimumUpdateIntervalSettings::Custom(33ms)` caps the
@@ -435,8 +439,9 @@ The render path does not re-borrow the view.
 
 `glass` is the lens backdrop: the newest live frame while the capture is
 `Running`, otherwise the latest wallpaper crop. Both arrive as the same
-`GlassBackdrop` (`image`, `luma`, `pad`), so the lens never branches on the
-source.
+`GlassBackdrop` (`image`, `luma`, `crop`, `shape`, `generation`), so the lens
+never branches on the source. A warp that lagged a shape change is mapped from
+its baked shell onto the current one until the queue catches up.
 
 `paint_motion` builds the listeners, then `chrome::paint`:
 
