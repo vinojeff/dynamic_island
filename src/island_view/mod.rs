@@ -612,21 +612,21 @@ impl IslandView {
         if fresh {
             if let Some(backdrop) = built {
                 self.warps.record_success();
+                let mut install: Option<wallpaper::GlassBackdrop> = None;
                 if request.dest == WarpDest::Static
                     && request.generation == self.static_generation
                 {
-                    let show = !self.live.is_live();
                     self.static_glass = Some(Arc::new(backdrop.clone()));
-                    if show {
-                        self.glass_luma = backdrop.luma;
-                        self.glass = Some(Arc::new(backdrop));
-                        cx.notify();
+                    if !self.live.is_live() {
+                        install = Some(backdrop);
                     }
-                }
-                if request.dest == WarpDest::Live
+                } else if request.dest == WarpDest::Live
                     && self.live.is_live()
                     && request.generation == self.live_generation
                 {
+                    install = Some(backdrop);
+                }
+                if let Some(backdrop) = install {
                     self.glass_luma = backdrop.luma;
                     self.glass = Some(Arc::new(backdrop));
                     cx.notify();
