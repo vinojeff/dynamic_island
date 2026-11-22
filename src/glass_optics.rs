@@ -199,6 +199,53 @@ pub fn corner_term(n: (f32, f32)) -> f32 {
     4.0 * n.0 * n.0 * n.1 * n.1
 }
 
+/// Sample offset for one output pixel, in image pixels. `None` copies the
+/// source pixel: clearly outside the shell (more than a pixel), past the
+/// bevel, or on the medial axis.
+#[must_use]
+pub fn displacement(
+    lut: &[f32; BEND_STEPS],
+    p: (f32, f32),
+    shell: Shell,
+    bevel_px: f32,
+    margins: Margins,
+) -> Option<(f32, f32)> {
+    if !(bevel_px > 0.0) {
+        return None;
+    }
+    let center = shell.center();
+    let half = shell.half();
+    let local = (p.0 - center.0, p.1 - center.1);
+    let d = -sd_round_rect(local, half, shell.radius);
+    // Pixel centers sit half a pixel off the geometry, and the exact arc
+    // point carries float error, so centers up to a pixel outside the
+    // silhouette are still edge pixels: clamp them onto the silhouette
+    // instead of leaving a one-pixel gap in the band.
+    if d <= -1.0 || d >= bevel_px {
+        return None;
+    }
+    let d = d.max(0.0);
+    let n = sdf_normal(local, half, shell.radius)?;
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "e is clamped to 0..=1 and BEND_STEPS is 64"
+    )]
+    let step = (e_of(d, bevel_px) * (BEND_STEPS - 1) as f32).round() as usize;
+    let depth = 0.8 * bevel_px;
+    let bend = lut.get(step).copied().unwrap_or(0.0) * depth
+        * (1.0 + CORNER_BOOST * corner_term(n));
+    Some((
+        (n.0 * bend).clamp(-margins.left, margins.right),
+        (n.1 * bend).clamp(-margins.top, margins.bottom),
+    ))
+}
+
+fn e_of(d: f32, bevel_px: f32) -> f32 {
+    (d / bevel_px).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
@@ -313,5 +360,90 @@ mod tests {
         let s = std::f32::consts::FRAC_1_SQRT_2;
         near(corner_term((s, -s)), 1.0);
         near(corner_term((0.5, -0.866_025_4)), 0.75);
+    }
+
+    fn card_shell() -> Shell {
+        Shell { x: 48.0, y: 48.0, width: 420.0, height: 288.0, radius: 24.0 }
+    }
+
+    fn even_margins() -> Margins {
+        Margins { left: 48.0, top: 48.0, right: 48.0, bottom: 48.0 }
+    }
+
+    fn top_left_45(shell: Shell) -> (f32, f32) {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let cx = shell.x + shell.width / 2.0;
+        let cy = shell.y + shell.height / 2.0;
+        let kx = cx - shell.width / 2.0 + shell.radius;
+        let ky = cy - shell.height / 2.0 + shell.radius;
+        (kx - shell.radius * s, ky - shell.radius * s)
+    }
+
+    #[test]
+    fn the_top_edge_pulls_straight_up_by_the_depth() {
+        let shell = card_shell();
+        let offset =
+            displacement(&bend_lut(), (shell.x + 210.0, shell.y), shell, 36.0, even_margins())
+                .unwrap();
+        near(offset.0, 0.0);
+        near(offset.1, -(0.8 * 36.0));
+    }
+
+    #[test]
+    fn the_45_degree_corner_pulls_along_the_normal_and_is_boosted() {
+        let shell = card_shell();
+        let (bx, by) =
+            displacement(&bend_lut(), top_left_45(shell), shell, 36.0, even_margins()).unwrap();
+        let len = (bx * bx + by * by).sqrt();
+        near(len, 0.8 * 36.0 * 1.3);
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        near(bx / len, -s);
+        near(by / len, -s);
+    }
+
+    #[test]
+    fn the_axis_clamp_spares_the_other_component() {
+        let shell = card_shell();
+        let margins = Margins { left: 0.0, top: 48.0, right: 48.0, bottom: 48.0 };
+        let (bx, by) = displacement(&bend_lut(), top_left_45(shell), shell, 36.0, margins).unwrap();
+        near(bx, 0.0);
+        assert!(by < -20.0, "the vertical bend must survive the x clamp: {by}");
+    }
+
+    #[test]
+    fn outside_and_center_pixels_are_copies() {
+        let shell = card_shell();
+        let lut = bend_lut();
+        let above = (shell.x + 210.0, shell.y - 10.0);
+        assert!(displacement(&lut, above, shell, 36.0, even_margins()).is_none());
+        let center = (shell.x + 210.0, shell.y + 144.0);
+        assert!(displacement(&lut, center, shell, 36.0, even_margins()).is_none());
+    }
+
+    #[test]
+    fn the_bend_never_reaches_past_the_margin() {
+        let shell = card_shell();
+        let lut = bend_lut();
+        let (bx, by) =
+            displacement(&lut, top_left_45(shell), shell, 36.0, even_margins()).unwrap();
+        assert!(bx.abs() <= 48.0 && by.abs() <= 48.0);
+    }
+
+    #[test]
+    fn tangent_and_midpoint_bend_alike_and_fall_off_inward() {
+        let shell = card_shell();
+        let lut = bend_lut();
+        let tangent =
+            displacement(&lut, (shell.x + 186.0, shell.y), shell, 36.0, even_margins()).unwrap();
+        let midpoint =
+            displacement(&lut, (shell.x + 210.0, shell.y), shell, 36.0, even_margins()).unwrap();
+        let tangent_len = (tangent.0 * tangent.0 + tangent.1 * tangent.1).sqrt();
+        let mid_len = (midpoint.0 * midpoint.0 + midpoint.1 * midpoint.1).sqrt();
+        assert!((tangent_len - mid_len).abs() < 0.1 * mid_len);
+        let inner =
+            displacement(&lut, (shell.x + 210.0, shell.y + 4.0), shell, 36.0, even_margins())
+                .unwrap();
+        let inner_len = (inner.0 * inner.0 + inner.1 * inner.1).sqrt();
+        assert!(inner_len < mid_len, "the bend must fall off inward");
     }
 }
