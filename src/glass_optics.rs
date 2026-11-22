@@ -246,6 +246,50 @@ fn e_of(d: f32, bevel_px: f32) -> f32 {
     (d / bevel_px).clamp(0.0, 1.0)
 }
 
+/// The shell rect inside one crop, in image pixels.
+///
+/// `stage_width` is the unclipped stage width in logical pixels — the same
+/// measure `crop_rects` centers against — and `crop` is the crop rect
+/// relative to the window's top-left, so a window hanging off the screen
+/// yields a negative `shell.x`.
+#[must_use]
+pub fn shell_rect(stage_width: f32, shape: GlassShape, crop: Rect, image_scale: f32) -> Shell {
+    let (shell, _) = crop_rects(stage_width, shape, crop);
+    Shell {
+        x: (shell.x - crop.x) * image_scale,
+        y: (shell.y - crop.y) * image_scale,
+        width: shape.width * image_scale,
+        height: shape.height * image_scale,
+        radius: shape.radius * image_scale,
+    }
+}
+
+/// The shell rect and the crop's natural rect, in logical pixels relative to
+/// the window's top-left. The shell's top sits on the window's top edge and
+/// the shell is centered horizontally; `crop` is returned unchanged.
+#[must_use]
+pub fn crop_rects(stage_width: f32, shape: GlassShape, crop: Rect) -> (Rect, Rect) {
+    let offset = (stage_width - shape.width) / 2.0;
+    let shell = Rect { x: offset, y: 0.0, width: shape.width, height: shape.height };
+    (shell, crop)
+}
+
+/// Maps the crop's natural rect from the baked shell's frame onto the current
+/// shell's frame, axially. `lens` uses this while a warp for the new shape is
+/// still in flight, so the old bevel rides the new edge instead of ghosting
+/// inside the panel. Callers must pass a non-degenerate `baked_shell`.
+#[must_use]
+pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect) -> Rect {
+    let sx = current_shell.width / baked_shell.width;
+    let sy = current_shell.height / baked_shell.height;
+    Rect {
+        x: current_shell.x + (natural.x - baked_shell.x) * sx,
+        y: current_shell.y + (natural.y - baked_shell.y) * sy,
+        width: natural.width * sx,
+        height: natural.height * sy,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
@@ -445,5 +489,70 @@ mod tests {
                 .unwrap();
         let inner_len = (inner.0 * inner.0 + inner.1 * inner.1).sqrt();
         assert!(inner_len < mid_len, "the bend must fall off inward");
+    }
+
+    fn card_shape() -> GlassShape {
+        GlassShape { width: 420.0, height: 288.0, radius: 24.0 }
+    }
+
+    fn capsule_shape() -> GlassShape {
+        GlassShape { width: 320.0, height: 56.0, radius: 28.0 }
+    }
+
+    fn stage_crop_rect() -> Rect {
+        Rect { x: -48.0, y: -48.0, width: 516.0, height: 456.0 }
+    }
+
+    #[test]
+    fn shell_rect_centers_the_card_and_offsets_the_capsule() {
+        let shell = shell_rect(420.0, card_shape(), stage_crop_rect(), 1.0);
+        near(shell.x, 48.0);
+        near(shell.y, 48.0);
+        near(shell.width, 420.0);
+        near(shell.radius, 24.0);
+        let shell = shell_rect(420.0, capsule_shape(), stage_crop_rect(), 1.25);
+        near(shell.x, (50.0 + 48.0) * 1.25);
+        near(shell.width, 400.0);
+    }
+
+    #[test]
+    fn an_offscreen_window_shifts_the_shell_negative() {
+        // The window hangs 10 physical px off the left edge (scale 1): the
+        // crop starts 10 px right of the window origin.
+        let crop = Rect { x: 10.0, y: 0.0, width: 458.0, height: 408.0 };
+        let shell = shell_rect(420.0, card_shape(), crop, 1.0);
+        near(shell.x, -10.0);
+        near(shell.y, 0.0);
+    }
+
+    #[test]
+    fn crop_rects_centers_the_shell_and_returns_the_natural_crop() {
+        let (shell, natural) = crop_rects(420.0, card_shape(), stage_crop_rect());
+        near(shell.x, 0.0);
+        near(shell.y, 0.0);
+        near(shell.width, 420.0);
+        near(natural.x, -48.0);
+        near(natural.width, 516.0);
+        let (shell, _) = crop_rects(420.0, capsule_shape(), stage_crop_rect());
+        near(shell.x, 50.0);
+        near(shell.y, 0.0);
+    }
+
+    #[test]
+    fn stale_image_bounds_maps_the_baked_shell_onto_the_current_one() {
+        let natural = stage_crop_rect();
+        let baked = Rect { x: 50.0, y: 0.0, width: 320.0, height: 56.0 };
+        let current = Rect { x: 0.0, y: 0.0, width: 420.0, height: 288.0 };
+        let image = stale_image_bounds(natural, baked, current);
+        let sx = 420.0 / 320.0;
+        let sy = 288.0 / 56.0;
+        near(image.x, (-48.0 - 50.0) * sx);
+        assert!((image.y - (-48.0 * sy)).abs() < 0.01);
+        near(image.width, 516.0 * sx);
+        assert!((image.height - 456.0 * sy).abs() < 0.01);
+        // Same shape: identity.
+        let same = stale_image_bounds(natural, current, current);
+        near(same.x, natural.x);
+        near(same.width, natural.width);
     }
 }
