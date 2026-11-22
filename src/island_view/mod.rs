@@ -57,11 +57,13 @@ use rustedge::volume::{self, Endpoint, VolumeCommand, VolumeState};
 
 /// The liquid-glass optics: lens underlay, scrim, sheen, rim, dispersion.
 mod glass;
+mod warp_queue;
 mod chrome;
 mod media_page;
 
 use chrome::{page_arrow_at, paint};
 use media_page::CardClicks;
+use warp_queue::{WarpDest, WarpQueue, WarpRequest};
 
 type Click = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
@@ -186,6 +188,15 @@ pub struct IslandView {
     /// the epoch they captured so a stale one cannot overwrite a snapshot
     /// taken for a later rect.
     glass_epoch: u64,
+    /// The newest static crop, kept around for shape-only re-warps.
+    static_raw: Option<std::sync::Arc<wallpaper::RawGlass>>,
+    /// The generation `static_raw` was built under.
+    static_generation: u64,
+    /// Smoothed backdrop lightness; `Face` reads this directly.
+    glass_luma: f32,
+    /// Pending, in-flight, and failed glass warps. Install rules live in
+    /// [`Self::finish_warp`].
+    warps: WarpQueue,
     /// Live capture state. It publishes through `glass` above.
     live: live_glass::LiveGlass,
     /// The last wallpaper crop, kept as the fallback while live capture runs.
@@ -253,6 +264,10 @@ impl IslandView {
             glass_building: false,
             glass_fingerprint: None,
             glass_epoch: 0,
+            static_raw: None,
+            static_generation: 0,
+            glass_luma: glass::IDLE_LUMA,
+            warps: WarpQueue::default(),
             live: live_glass::LiveGlass::new(),
             static_glass: None,
             live_on: false,
@@ -367,6 +382,7 @@ impl IslandView {
                         if view.poll_live(cx) {
                             cx.notify();
                         }
+                        view.poll_warp(cx);
                         if view.state == IslandState::Capsule {
                             cx.notify();
                         }
@@ -467,18 +483,14 @@ impl IslandView {
         });
     }
 
-    /// Refreshes the glass backdrop when the wallpaper or the stage moved.
+    /// Refreshes the static glass when the wallpaper or the stage moved.
     ///
-    /// One comparison per tick. When the fingerprint moves — the wallpaper
-    /// file, or the window's physical rect after a slide or a DPI change —
-    /// the full decode runs off-thread and the result lands through
-    /// `view.update`. A failed build still stores its fingerprint: a broken
-    /// wallpaper must not re-decode every tick. (The rect is what the
-    /// fingerprint carries, not the scale; across a DPI boundary the physical
-    /// rect changes by itself.)
+    /// One fingerprint comparison per 2s tick. A changed fingerprint bumps
+    /// the epoch, decodes off-thread, and warps through the queue. A failed
+    /// build still records the fingerprint so a broken wallpaper does not
+    /// re-decode every poll.
     fn poll_glass(&mut self, cx: &mut Context<Self>) {
-        // Live owns the glass. One static build is still allowed to seed the
-        // fallback slot; after that the wallpaper is not sampled at all.
+        // Live owns the glass; one static build still seeds the fallback slot.
         if self.live.is_live() && self.static_glass.is_some() {
             return;
         }
@@ -489,41 +501,51 @@ impl IslandView {
             return;
         };
         let rect = (origin_x, origin_y, width, height);
-        let epoch = self.glass_epoch();
         cx.spawn(async move |view, cx| {
             let snapshot =
                 cx.background_executor().spawn(async move { wallpaper::fingerprint_now(rect) }).await;
-            // A stale epoch or an unchanged fingerprint cancels the build.
-            let started = view.update(cx, |view, _cx| {
-                if view.glass_epoch == epoch && snapshot != view.glass_fingerprint {
+            // Bump the epoch only when the fingerprint truly moved, so an
+            // idle poll never invalidates an in-flight warp.
+            let epoch = view
+                .update(cx, |view, _| {
+                    if snapshot == view.glass_fingerprint {
+                        return None;
+                    }
                     view.glass_building = true;
-                    true
-                } else {
-                    false
-                }
-            });
-            if !started.is_ok_and(|started| started) {
+                    view.glass_epoch = view.glass_epoch.wrapping_add(1);
+                    Some(view.glass_epoch)
+                })
+                .ok()
+                .flatten();
+            let Some(epoch) = epoch else {
                 return;
-            }
+            };
             let built = cx
                 .background_executor()
-                .spawn(async move {
-                    let screen = wallpaper::screen_size();
-                    wallpaper::build_raw(screen, rect, scale)
-                        .and_then(|raw| raw.warp(GlassShape::ZERO, None))
-                })
+                .spawn(async move { wallpaper::build_raw(wallpaper::screen_size(), rect, scale) })
                 .await;
             view.update(cx, |view, cx| {
                 if view.glass_epoch != epoch {
                     return;
                 }
                 view.glass_building = false;
-                // Stored on failure too: None backdrop, recorded fingerprint.
                 view.glass_fingerprint = snapshot;
-                let built = built.map(std::sync::Arc::new);
-                view.static_glass.clone_from(&built);
-                if !view.live.is_live() {
-                    view.glass = built;
+                if let Some(mut raw) = built {
+                    raw.generation = epoch;
+                    let raw = Arc::new(raw);
+                    view.static_raw = Some(Arc::clone(&raw));
+                    view.static_generation = epoch;
+                    let shape = GlassShape::from(view.shown.shape.get());
+                    view.request_warp(raw, shape, WarpDest::Static, cx);
+                } else {
+                    view.static_raw = None;
+                    view.static_glass = None;
+                    view.static_generation = 0;
+                    // A queued static warp would run against a dead raw.
+                    view.warps.clear_dest(WarpDest::Static);
+                    if !view.live.is_live() {
+                        view.glass = None;
+                    }
                 }
                 cx.notify();
             })
@@ -532,11 +554,105 @@ impl IslandView {
         .detach();
     }
 
-    /// Bumped by the poller whenever a new build gets scheduled, so a stale
-    /// completion cannot overwrite a snapshot taken for a later rect.
-    fn glass_epoch(&mut self) -> u64 {
-        self.glass_epoch = self.glass_epoch.saturating_add(1);
-        self.glass_epoch
+    /// Queues one background warp for `raw`. Duplicates and known failures
+    /// are dropped by the queue; a busy queue keeps the request pending.
+    fn request_warp(
+        &mut self,
+        raw: Arc<wallpaper::RawGlass>,
+        shape: GlassShape,
+        dest: WarpDest,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.warps.request(raw, shape, dest) else {
+            return;
+        };
+        if self.warps.busy() {
+            return;
+        }
+        self.warps.mark_started(&request);
+        self.spawn_warp(request, cx);
+    }
+
+    /// Runs one warp on the background executor. `raw` and `shape` are cloned
+    /// out of the request first so the inner block and the completion handler
+    /// do not fight over the same move.
+    fn spawn_warp(&mut self, request: WarpRequest, cx: &mut Context<Self>) {
+        let luma = match request.dest {
+            WarpDest::Live => Some(self.glass_luma),
+            WarpDest::Static => None,
+        };
+        let raw = Arc::clone(&request.raw);
+        let shape = request.shape;
+        cx.spawn(async move |view, cx| {
+            let built = cx
+                .background_executor()
+                .spawn(async move { raw.warp(shape, luma) })
+                .await;
+            view.update(cx, |view, cx| view.finish_warp(&request, built, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Installs a finished warp when it is still the newest one, then starts
+    /// the next pending request. Failures keep the old image and mark the
+    /// request so the poller stops re-issuing it.
+    fn finish_warp(
+        &mut self,
+        request: &WarpRequest,
+        built: Option<wallpaper::GlassBackdrop>,
+        cx: &mut Context<Self>,
+    ) {
+        let fresh = self.warps.finish(request);
+        if fresh {
+            if let Some(backdrop) = built {
+                self.warps.record_success();
+                if request.dest == WarpDest::Static
+                    && request.generation == self.static_generation
+                {
+                    let show = !self.live.is_live();
+                    self.static_glass = Some(Arc::new(backdrop.clone()));
+                    if show {
+                        self.glass_luma = backdrop.luma;
+                        self.glass = Some(Arc::new(backdrop));
+                        cx.notify();
+                    }
+                }
+                // Live installation arrives with the live wiring.
+            } else {
+                self.warps.record_failed(request);
+                eprintln!("glass warp failed (generation {})", request.generation);
+            }
+        }
+        self.start_pending_warp(cx);
+    }
+
+    fn start_pending_warp(&mut self, cx: &mut Context<Self>) {
+        if self.warps.busy() {
+            return;
+        }
+        let Some(request) = self.warps.take_pending() else {
+            return;
+        };
+        self.warps.mark_started(&request);
+        self.spawn_warp(request, cx);
+    }
+
+    /// Re-warps the newest raw whenever only the shape moved — the desktop
+    /// did not change, so WGC will not send a frame.
+    fn poll_warp(&mut self, cx: &mut Context<Self>) {
+        let shape = GlassShape::from(self.shown.shape.get());
+        if self.live.is_live() {
+            return; // the live branch lands with the live wiring
+        }
+        if let Some(raw) = self.static_raw.clone() {
+            let stale = self
+                .glass
+                .as_ref()
+                .is_none_or(|g| g.generation != raw.generation || g.shape != shape);
+            if stale {
+                self.request_warp(raw, shape, WarpDest::Static, cx);
+            }
+        }
     }
 
     /// Resolves `RUSTEDGE_GLASS` for this launch. The window handle is not
@@ -578,6 +694,7 @@ impl IslandView {
             self.live_on = true;
             self.glass_epoch = self.glass_epoch.saturating_add(1);
             self.glass_building = false;
+            self.warps.clear_pending();
             cx.notify();
             return;
         }
@@ -593,9 +710,14 @@ impl IslandView {
     /// installed crop is rebuilt once because the fingerprint is cleared.
     fn restore_static_glass(&mut self) {
         self.glass = self.static_glass.clone();
+        self.glass_luma = self
+            .static_glass
+            .as_ref()
+            .map_or(glass::IDLE_LUMA, |backdrop| backdrop.luma);
         self.glass_fingerprint = None;
         self.glass_epoch = self.glass_epoch.saturating_add(1);
         self.glass_building = false;
+        self.warps.clear_pending();
     }
 
     /// Stops the session without waiting for it on the UI thread.
@@ -707,6 +829,7 @@ impl IslandView {
         let (frame, action) = self.live.take_frame(now);
         self.apply_live(action, cx);
         if let Some(frame) = frame {
+            self.glass_luma = frame.luma;
             self.glass = Some(frame);
             true
         } else {
@@ -978,7 +1101,7 @@ impl IslandView {
             perf: self.perf.clone(),
             page_slide: self.page_slide,
             glass: self.glass.as_ref().map(|backdrop| Arc::clone(&backdrop.image)),
-            glass_luma: self.glass.as_ref().map_or(glass::IDLE_LUMA, |backdrop| backdrop.luma),
+            glass_luma: self.glass_luma,
         }
     }
 
