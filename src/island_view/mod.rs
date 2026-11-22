@@ -623,7 +623,15 @@ impl IslandView {
                         cx.notify();
                     }
                 }
-                // Live installation arrives with the live wiring.
+                if request.dest == WarpDest::Live
+                    && self.live.is_live()
+                    && request.generation == self.live_generation
+                {
+                    self.glass_luma = backdrop.luma;
+                    self.glass = Some(Arc::new(backdrop));
+                    cx.notify();
+                }
+                // Stale or blocked completions install nothing.
             } else {
                 self.warps.record_failed(request);
                 eprintln!("glass warp failed (generation {})", request.generation);
@@ -648,7 +656,17 @@ impl IslandView {
     fn poll_warp(&mut self, cx: &mut Context<Self>) {
         let shape = GlassShape::from(self.shown.shape.get());
         if self.live.is_live() {
-            return; // the live branch lands with the live wiring
+            let Some(raw) = self.last_live_raw.clone() else {
+                return;
+            };
+            let stale = self
+                .glass
+                .as_ref()
+                .is_none_or(|g| g.generation != raw.generation || g.shape != shape);
+            if stale {
+                self.request_warp(raw, shape, WarpDest::Live, cx);
+            }
+            return;
         }
         if let Some(raw) = self.static_raw.clone() {
             let stale = self
