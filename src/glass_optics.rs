@@ -135,6 +135,17 @@ const REFRACTIVE_INDEX: f32 = 1.5;
 const TAPER_START: f32 = 0.75;
 /// Extra bend at the 45° corner, on top of the base Snell bend.
 pub(crate) const CORNER_BOOST: f32 = 0.30;
+/// `depth / bevel`: how deep into the band the pull reaches.
+const DEPTH_FACTOR: f32 = 0.8;
+/// Max growth of the sample offset between adjacent pixels, in image pixels.
+///
+/// A single bilinear tap shrinks ~2:1 cleanly. The raw Snell profile has a
+/// vertical wall at the silhouette — its slope diverges like `e^(-3/4)`, an
+/// ~11:1 minification that reads as jaggies — so the LUT integrates the
+/// profile with its slope capped: it follows Snell wherever that curve is
+/// gentle enough and rides a fixed cap line where it is not. The edge pull
+/// itself is untouched; the visibly bending band just gets longer and smooth.
+const MAX_SAMPLE_STEP: f32 = 2.0;
 
 /// `tan(θi - θt)` for a surface slope `dh/dd`, air → glass. A vertical wall
 /// (`INFINITY`) saturates at `sqrt(n²-1)`.
@@ -153,15 +164,8 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Normalized Snell bend at bevel progress `e` (0 at the silhouette, 1 at
-/// the inner edge).
-///
-/// The height profile is `h(e) = bevel * (1-(1-e)^p)^(1/p)` with the height
-/// equal to the bevel width, so `dh/dd` cancels the bevel and the curve is
-/// shape-independent. The raw bend is divided by its edge limit and tapered
-/// to zero at the inner edge for a C1 handoff to the flat center.
-#[must_use]
-pub fn bend_at(e: f32) -> f32 {
+/// The un-capped normalized Snell curve — the shape the LUT integrates.
+fn raw_bend(e: f32) -> f32 {
     let e = e.clamp(0.0, 1.0);
     if e >= 1.0 {
         return 0.0;
@@ -179,16 +183,43 @@ pub fn bend_at(e: f32) -> f32 {
 }
 
 /// The bend profile sampled once per warp pass.
+///
+/// Integrated from `raw_bend` with the per-pixel sample step capped at
+/// [`MAX_SAMPLE_STEP`]; outside the cap the curve is the raw Snell shape, at
+/// the silhouette it rides the cap line. Reaches zero before the inner edge
+/// and stays there, which blends seamlessly into the copied center.
 #[must_use]
 pub fn bend_lut() -> [f32; BEND_STEPS] {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "BEND_STEPS is 64; the quotients are exact in f32"
+    )]
+    let dt = 1.0 / (BEND_STEPS - 1) as f32;
+    // Δoffset per pixel = depth·Δlut and Δd = bevel·dt, so capping the step
+    // at MAX_SAMPLE_STEP caps Δlut per entry at the quotient below.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "BEND_STEPS is 64; the quotient is exact in f32"
+    )]
+    let max_lut_step = MAX_SAMPLE_STEP / (DEPTH_FACTOR * (BEND_STEPS - 1) as f32);
     let mut lut = [0.0; BEND_STEPS];
-    for (step, slot) in lut.iter_mut().enumerate() {
+    lut[0] = 1.0;
+    let mut remaining = 1.0;
+    for step in 1..BEND_STEPS {
+        let e = (step as f32 - 0.5) * dt;
+        // raw_bend decreases inward, so the drop between the neighbours is
+        // the positive quantity. Beyond the cap the profile rides the cap
+        // line; near the end it accelerates along the even split so the
+        // curve lands exactly on zero at the inner edge.
+        let raw_drop = (raw_bend(e - dt) - raw_bend(e + dt)) / (2.0 * dt) * dt;
         #[allow(
             clippy::cast_precision_loss,
             reason = "BEND_STEPS is 64; the quotient is exact in f32"
         )]
-        let e = step as f32 / (BEND_STEPS - 1) as f32;
-        *slot = bend_at(e);
+        let steps_left = (BEND_STEPS - step) as f32;
+        let descent = (raw_drop.max(remaining / steps_left)).min(max_lut_step);
+        lut[step] = (lut[step - 1] - descent).max(0.0);
+        remaining = (remaining - descent).max(0.0);
     }
     lut
 }
@@ -226,16 +257,27 @@ pub fn displacement(
     }
     let d = d.max(0.0);
     let n = sdf_normal(local, half, shell.radius)?;
+    // Linear interpolation between LUT entries: nearest-neighbour lookup
+    // quantized the bend into visible micro-rings exactly where the profile
+    // is steepest.
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "e is clamped to 0..=1 and BEND_STEPS is 64"
     )]
-    let step = (e_of(d, bevel_px) * (BEND_STEPS - 1) as f32).round() as usize;
-    let depth = 0.8 * bevel_px;
-    let bend = lut.get(step).copied().unwrap_or(0.0) * depth
-        * (1.0 + CORNER_BOOST * corner_term(n));
+    let x = e_of(d, bevel_px) * (BEND_STEPS - 1) as f32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "x is clamped to 0..=BEND_STEPS-1"
+    )]
+    let index = x.floor() as usize;
+    let t = x - index as f32;
+    let low = lut.get(index).copied().unwrap_or(0.0);
+    let high = lut.get(index + 1).copied().unwrap_or(low);
+    let depth = DEPTH_FACTOR * bevel_px;
+    let bend = (low + (high - low) * t) * depth * (1.0 + CORNER_BOOST * corner_term(n));
     Some((
         (n.0 * bend).clamp(-margins.left, margins.right),
         (n.1 * bend).clamp(-margins.top, margins.bottom),
@@ -585,6 +627,38 @@ mod tests {
                 .unwrap();
         let inner_len = (inner.0 * inner.0 + inner.1 * inner.1).sqrt();
         assert!(inner_len < mid_len, "the bend must fall off inward");
+    }
+
+    #[test]
+    fn adjacent_rows_never_sample_more_than_two_pixels_apart() {
+        // Regression: the raw Snell profile has a vertical wall at the
+        // silhouette — the first LUT step moved the sample ~6px over half a
+        // pixel of inward distance, an 11:1 minification that bilinear cannot
+        // represent. The visible symptom was jaggies along the whole edge.
+        let shell = card_shell();
+        let lut = bend_lut();
+        let mut prev =
+            displacement(&lut, (shell.x + 210.0, shell.y), shell, 36.0, even_margins()).unwrap();
+        for row in 1..=12 {
+            let p = (shell.x + 210.0, shell.y + 0.5 * row as f32);
+            let cur = displacement(&lut, p, shell, 36.0, even_margins()).unwrap();
+            let step = ((cur.0 - prev.0).abs() + (cur.1 - prev.1).abs()).sqrt();
+            assert!(
+                step <= 2.2,
+                "row {row}: sample moved {step:.2}px between adjacent pixels"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn the_lut_never_steps_more_than_the_slope_cap() {
+        let lut = bend_lut();
+        for pair in lut.windows(2) {
+            if let [a, b] = pair {
+                assert!(a - b <= 0.042, "the profile cliff is back: {a} -> {b} in one step");
+            }
+        }
     }
 
     fn card_shape() -> GlassShape {

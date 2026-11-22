@@ -94,7 +94,8 @@ depth  = 0.8 * bevel_px
 corner_boost(n) = 1 + 0.30 * 4 * n.x² * n.y²
 ```
 
-- `lut(e)`：超椭圆剖面 `h(e) = bevel * (1 - (1-e)^p)^(1/p)`，`p = 4`；斜率 `dh/dd` 经精确 Snell（`n = 1.5`）得到 `tan(θi - θt)`，按边缘上限 `sqrt(n²-1)` 归一化到 `0..1`；再乘 `1 - smoothstep(0.75, 1.0, e)` 让内缘 C1 收口。`h` 的高度取 `bevel`，所以 LUT 与具体 bevel 宽度无关；每次 warp 前算 64 项即可，`e = 0` 直接取 1。
+- `lut(e)`：超椭圆剖面 `h(e) = bevel * (1 - (1-e)^p)^(1/p)`，`p = 4`；斜率 `dh/dd` 经精确 Snell（`n = 1.5`）得到 `tan(θi - θt)`，按边缘上限 `sqrt(n²-1)` 归一化到 `0..1`。`h` 的高度取 `bevel`，所以 LUT 与具体 bevel 宽度无关；每次 warp 前算 64 项即可。
+- **斜率封顶**：原始 Snell 曲线在轮廓处是垂直墙（斜率按 `e^(-3/4)` 发散），单次双线性采样扛不住 ~11:1 的缩小，边缘会出明显锯齿。LUT 改为按封顶斜率积分：斜率平缓处跟随 Snell，陡处走封顶线（相邻像素采样步进 ≤ 2px），末端按均摊下降精确落到 0。边缘拉力不变（`lut(0)=1`），可见弯曲带变长变平滑。查询用线性插值，避免最近邻量化在陡处出微环。
 - `corner_boost`：直边为 0，45° 转角为 1；`4 n.x² n.y² = sin²(2θ)`，比参考项目的 `max(min(x,1-x), min(y,1-y))` 更平滑，胶囊端头也适用。
 - 只在 bevel 带内重采样；`d >= bevel_px`（中心）和 `d <= -1px`（crop 的 margin 区）都直接拷贝。像素中心允许 1px 外侧容差并 clamp 到轮廓上——精确落在弧上的点自带浮点误差，不然边缘会留 1px 缝隙。
 - 采样：`sample = p + (bx, by)`，其中 `bx = (n.x * bend).clamp(-margins.left, margins.right)`，`by = (n.y * bend).clamp(-margins.top, margins.bottom)`；`margins` 是 shell 到图像四边的可用距离（见上）。逐轴 clamp，贴屏一侧不越界，另一轴仍保留弯曲。
