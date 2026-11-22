@@ -253,7 +253,7 @@ static_generation: u64,
   - 成功：`raw.generation = epoch`，`static_raw = Some(Arc::new(raw))`，`static_generation = epoch`，`request_warp(Static)`。**必须先给 raw 赋 generation**，否则 `finish_warp` 的 `generation == static_generation` 永远不成立。
   - 失败：`static_raw = None`、`static_glass = None`；清 pending 的 Static 请求并 bump `static_generation`，让在飞的旧 static warp 失效；静态在管时 `glass = None`，回退 wash。
 - `restore_static_glass`：清 `last_live_raw`、`live_generation`、`warp_pending`；`glass = static_glass.clone()`、`glass_luma = static_glass.map_or(IDLE_LUMA, |b| b.luma)`（无 static 则 `glass = None`）；保留 `static_raw`；bump epoch；下一次 `poll_warp` 按当前形状重 warp。
-- `Face.glass_luma` 改为直接取 view 的 `glass_luma`（平滑值），不再从 `self.glass.luma` 推导；安装 live/static 时都更新它。`GlassShape::from(island::Morph)` 在 view 侧实现，只取 `width/height/radius`。
+- `Face.glass_luma` 改为直接取 view 的 `glass_luma`（平滑值），不再从 `self.glass.luma` 推导；安装 live/static 时都更新它。`GlassShape::from(island::Morph)` 在 `glass_optics` 实现，只取 `width/height/radius`，view 和测试共用。
 
 ### `src/island_view/glass.rs`
 
@@ -273,7 +273,7 @@ static_generation: u64,
   - 过期帧的 bevel 宽度会随轴向缩放；32ms 队列落地后回到 1:1。这是过渡帧的折中，不会留下永久错误。`backdrop.shape.width/height <= 0` 时直接退回 `natural`，避免除零。
 - 删除 `glass.rs::paint_lens`（64 环）、`LENS_RINGS`、`REFRACTION_PULL`、`refraction_depth`、`refraction_pull`、`lens_bounds`、`shrink_factor`、`inset_shell`、`paint_crop`、`bounds_from` 及对应测试。`chrome.rs::paint_lens` 是顶部线形玻璃的另一套函数，不动。
 - `paint_rim` 删除两条色散环和 `DISPERSION` 常量；三条白色 Fresnel 带保留。
-- `shell_offset` 改成 `shell_offset(stage_width, shape_width)`，`lens` 用 canvas 宽度，`RawGlass` 用 `stage_width`，两边共用同一公式。
+- `shell_offset` 删除；`glass_optics::crop_rects` 就是共享的居中公式，`lens` 用 canvas 宽度、`RawGlass` 用 `stage_width`，两边都走它。
 - `veil_alpha`、`rim_alpha`、`shell_shadows`、`layers` 的 scrim/sheen 不变。
 - `GlassBackdrop` 的测试构造补 `crop`、`shape`、`generation`。
 
