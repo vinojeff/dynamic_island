@@ -214,7 +214,7 @@ pub(crate) struct CropSpec {
 - `poll_live`：
   - 取 `Frame`；`live_generation = frame.generation`，`last_live_raw = Some(frame.raw)`，`glass_luma = frame.luma`。
   - 有 `warped` 就直接安装；没有就留给 `poll_warp`。
-  - `update_crop` 返回 `true`（DPI/crop 变化）时清空 `last_live_raw`、`live_generation`，**清 `glass` 回退 wash**（旧 `static_glass` 可能属于旧 rect，不能当正确回退），并立即走一次 `poll_glass` 的 **force 分支**（绕过“live 已 seed 就早退”的检查，强制新 rect 的静态重建）；新几何的 live 帧到达后恢复。
+  - `update_crop` 返回 `true`（DPI/crop 变化）时清空 `last_live_raw`、`live_generation`，**清 `glass` 回退 wash**（旧 `static_glass` 可能属于旧 rect，不能当正确回退）。不要在每个 32ms tick 强制重建静态图：滑动/DPI 变化会持续触发几何变化，会把后台 executor 打满；新 rect 的静态图交给下一次 2s `poll_glass`（指纹含 rect），新几何的 live 帧到达后恢复。
 - `poll_warp`：
   - 当前 `shape = GlassShape::from(self.shown.shape.get())`。
   - live 且 `last_live_raw` 存在，并且 `glass` 为 `None` 或 `glass.generation != raw.generation || glass.shape != shape` → 请求 Live warp。
@@ -247,11 +247,11 @@ static_generation: u64,
     - Live：`live.is_live()` 且 `generation == live_generation` → 写 `glass`，`glass_luma = backdrop.luma`，清 `warp_failed`。
     - Static：`generation == static_generation` → 总是写 `static_glass`；`!live.is_live()` 时同时写 `glass` 和 `glass_luma = backdrop.luma`；清 `warp_failed`。
   - 失败（`None`）保留旧图，打日志，记 `warp_failed = Some((generation, shape, dest))`；随后启动 pending。`poll_warp` 在 raw generation 或 shape 变化前不会重试同一请求，避免 32ms 空转。
-  - 切换 live/static：bump `glass_epoch`、清 `warp_pending`；在飞的 completion 会因 ticket/generation 失败而丢弃，但 `warp_in_flight` 仍由 completion 自己清空，不能提前清成 `None` 后忘记复位。
-- `poll_glass`（2s，带 `force` 参数）：
-  - 后台比较指纹；只有 fingerprint 真的变化或 `force` 时才 bump `glass_epoch` 并启动 `build_raw`，不再每次轮询都 bump。`force` 只由几何变化触发。
+  - 切换 live/static：bump `glass_epoch` 使旧 raw build 失效、清 `warp_pending`；Live 的在飞 completion 因 `live.is_live()` 失败而丢弃，Static 的 completion 仍可更新 `static_glass`（不写 `glass`）。`warp_in_flight` 由 completion 自己清空，不要提前清成 `None` 后忘记复位。
+- `poll_glass`（2s）：
+  - 后台比较指纹；只有 fingerprint 真的变化时才 bump `glass_epoch` 并启动 `build_raw`，不再每次轮询都 bump。
   - 成功：`raw.generation = epoch`，`static_raw = Some(Arc::new(raw))`，`static_generation = epoch`，`request_warp(Static)`。**必须先给 raw 赋 generation**，否则 `finish_warp` 的 `generation == static_generation` 永远不成立。
-  - 失败：`static_raw = None`、`static_glass = None`；静态在管时 `glass = None`，回退 wash。
+  - 失败：`static_raw = None`、`static_glass = None`；清 pending 的 Static 请求并 bump `static_generation`，让在飞的旧 static warp 失效；静态在管时 `glass = None`，回退 wash。
 - `restore_static_glass`：清 `last_live_raw`、`live_generation`、`warp_pending`；`glass = static_glass.clone()`、`glass_luma = static_glass.map_or(IDLE_LUMA, |b| b.luma)`（无 static 则 `glass = None`）；保留 `static_raw`；bump epoch；下一次 `poll_warp` 按当前形状重 warp。
 - `Face.glass_luma` 改为直接取 view 的 `glass_luma`（平滑值），不再从 `self.glass.luma` 推导；安装 live/static 时都更新它。`GlassShape::from(island::Morph)` 在 view 侧实现，只取 `width/height/radius`。
 
@@ -312,7 +312,7 @@ static_generation: u64,
 - `CropSpec`：shape 变化只更新 shape，geometry 不变时 `update_crop` 返回 `false`；`image_scale = scale/factor`；`stage_width` 正确；`CropSpec::EMPTY` 字段完整。
 - `GlassShape::from(Morph)`：只取 `width/height/radius`。
 - warp 队列：Live 帧安装后，一个 Static completion 不覆盖 `glass`；Live completion 在更新帧到达后按 generation 丢弃；失败 completion 清 `warp_in_flight` 并启动 pending；warp 超过 32ms 时重复 `poll_warp` 不 bump ticket，在飞结果仍能安装。
-- 几何变化：`update_crop` 返回 `true` 时清 `glass` 回退 wash，并立即触发 `poll_glass`；旧 `static_glass` 不被当作正确回退。
+- 几何变化：`update_crop` 返回 `true` 时清 `glass` 回退 wash；旧 `static_glass` 不被当作正确回退；下一次 2s 指纹轮询负责新 rect 的重建，不在 32ms tick 里反复触发。
 - 失败路径：`build_raw` 失败清 `static_raw`/`static_glass`；warp 失败保留旧图、记 `warp_failed`，同一 `(generation, shape, dest)` 不再被 32ms 轮询重试，raw/shape 变化后恢复。
 - `luma`：Live 重 warp 使用当前平滑值，不回退到 raw luma；`warped == None` 时 `Frame.luma` 仍更新 `glass_luma`。
 - 旧 64 环测试删除；`crop_spec` 测试的 margin 从 40 改 48（crop 边界随之变化）。
