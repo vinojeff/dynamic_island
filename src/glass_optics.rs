@@ -124,6 +124,81 @@ pub fn bevel_width(shape: GlassShape) -> f32 {
     (min * 0.18).clamp(10.0, 36.0).min(min / 2.0)
 }
 
+/// LUT resolution for the bend profile. 64 entries are far denser than the
+/// band reads.
+const BEND_STEPS: usize = 64;
+/// Superellipse exponent of the bevel height profile.
+const BEVEL_POWER: f32 = 4.0;
+/// Glass index of refraction, air → glass.
+const REFRACTIVE_INDEX: f32 = 1.5;
+/// Fraction of the bevel where the inner-edge taper starts.
+const TAPER_START: f32 = 0.75;
+/// Extra bend at the 45° corner, on top of the base Snell bend.
+pub(crate) const CORNER_BOOST: f32 = 0.30;
+
+/// `tan(θi - θt)` for a surface slope `dh/dd`, air → glass. A vertical wall
+/// (`INFINITY`) saturates at `sqrt(n²-1)`.
+fn snell_bend(slope: f32) -> f32 {
+    let theta_i = slope.atan();
+    let sin_t = (theta_i.sin() / REFRACTIVE_INDEX).clamp(-1.0, 1.0);
+    (theta_i - sin_t.asin()).tan()
+}
+
+fn index_limit() -> f32 {
+    (REFRACTIVE_INDEX * REFRACTIVE_INDEX - 1.0).sqrt()
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Normalized Snell bend at bevel progress `e` (0 at the silhouette, 1 at
+/// the inner edge).
+///
+/// The height profile is `h(e) = bevel * (1-(1-e)^p)^(1/p)` with the height
+/// equal to the bevel width, so `dh/dd` cancels the bevel and the curve is
+/// shape-independent. The raw bend is divided by its edge limit and tapered
+/// to zero at the inner edge for a C1 handoff to the flat center.
+#[must_use]
+pub fn bend_at(e: f32) -> f32 {
+    let e = e.clamp(0.0, 1.0);
+    if e >= 1.0 {
+        return 0.0;
+    }
+    let inward = 1.0 - e;
+    // dh/dd = (1-e)^(p-1) * (1-(1-e)^p)^(1/p - 1); e = 0 is a vertical wall.
+    let base = 1.0 - inward.powf(BEVEL_POWER);
+    let slope = if base <= 0.0 {
+        f32::INFINITY
+    } else {
+        inward.powf(BEVEL_POWER - 1.0) * base.powf(1.0 / BEVEL_POWER - 1.0)
+    };
+    let bend = snell_bend(slope) / index_limit();
+    bend * (1.0 - smoothstep(TAPER_START, 1.0, e))
+}
+
+/// The bend profile sampled once per warp pass.
+#[must_use]
+pub fn bend_lut() -> [f32; BEND_STEPS] {
+    let mut lut = [0.0; BEND_STEPS];
+    for (step, slot) in lut.iter_mut().enumerate() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "BEND_STEPS is 64; the quotient is exact in f32"
+        )]
+        let e = step as f32 / (BEND_STEPS - 1) as f32;
+        *slot = bend_at(e);
+    }
+    lut
+}
+
+/// Corner emphasis: `sin²(2θ)` — 0 on straight edges, 1 at the 45° point.
+#[must_use]
+pub fn corner_term(n: (f32, f32)) -> f32 {
+    4.0 * n.0 * n.0 * n.1 * n.1
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert the precondition themselves")]
 mod tests {
@@ -210,5 +285,33 @@ mod tests {
         near(bevel_width(thin), 6.0);
         let tiny = GlassShape { width: 8.0, height: 8.0, radius: 4.0 };
         near(bevel_width(tiny), 4.0);
+    }
+
+    #[test]
+    fn snell_bend_matches_known_slopes() {
+        near(snell_bend(0.0), 0.0);
+        // slope 1: tan(45° - asin(sin45°/1.5)) ≈ 0.3034
+        assert!((snell_bend(1.0) - 0.3034).abs() < 2e-3);
+        // a vertical wall bends hardest: sqrt(n²-1)
+        near(snell_bend(f32::INFINITY), (1.5f32 * 1.5 - 1.0).sqrt());
+    }
+
+    #[test]
+    fn bend_runs_from_one_to_zero_and_falls_monotonically() {
+        let lut = bend_lut();
+        near(lut[0], 1.0);
+        near(lut[63], 0.0);
+        for pair in lut.windows(2) {
+            assert!(pair[0] >= pair[1], "bend must not grow inward: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn corner_term_peaks_at_45_degrees() {
+        near(corner_term((0.0, -1.0)), 0.0);
+        near(corner_term((1.0, 0.0)), 0.0);
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        near(corner_term((s, -s)), 1.0);
+        near(corner_term((0.5, -0.866_025_4)), 0.75);
     }
 }
