@@ -439,7 +439,10 @@ mod tests {
     #[test]
     fn veil_thickens_on_a_dark_wallpaper_and_thins_on_a_bright_one() {
         assert_eq!(veil_alpha(0.0), 0.15, "dark wallpaper → more milk");
-        assert_eq!(veil_alpha(1.0), 0.06, "bright wallpaper → less milk");
+        assert!(
+            (veil_alpha(1.0) - 0.06).abs() < 1e-6,
+            "bright wallpaper → less milk"
+        );
         let mut luma = 0.0;
         while luma <= 1.0 {
             assert!(
