@@ -337,6 +337,24 @@ static_generation: u64,
 - warp 队列必须同时保存 `warp_pending` 和 `warp_in_flight`；只保留一个槽会让 32ms 轮询不断 bump ticket，长 warp 永远装不上。
 - 窗口部分出屏时 `crop` 为有符号矩形；`shell_rect`/`crop_rects` 的测试必须覆盖这一支，避免回退到旧的 `pad` 假设。
 
+## 与 liquid-glass-js 参考对齐（2026-11-22）
+
+按 dashersw/liquid-glass-js demo 默认值（`controls.js`）校准：
+
+| 维度 | 参考默认 | 本实现 |
+| --- | --- | --- |
+| 全脸模糊 | `blurRadius 5`（σ2.5 高斯） | `FACE_BLUR_SIGMA = 2.5`，3 次盒式模糊近似，warp 前整脸应用 |
+| 中心 warp | `warp: false` | 只有 bevel 带，中心拷贝（一致） |
+| 边缘位移 | 边缘 ~30px、~20px 衰减 | 28.8px；斜率封顶放宽到 4px/px（模糊压住锯齿） |
+| 转角增益 | 与边缘同量级、慢衰减 | `CORNER_BOOST 0.5`（1.5×） |
+| tint | 20% 白→灰(0.7) 垂直渐变 + 6% 自适应色 | 中性白→灰(0.82)，`veil_alpha` 0.06~0.15 + 自适应 luma |
+| 高光 streak / 白 rim | 无 | sheen 0.04/0.02；rim 0.40/0.14/0.05（薄，定义轮廓用） |
+| 阴影 | `0 25px 50px rgba(0,0,0,0.25)` | `0 20px 48px 0.25` |
+
+参考的"柔"主要来自 σ2.5 模糊而非奶白纱；模糊也让斜率封顶可以放松（2→4px/px），边缘更有冲击力而不出锯齿。模糊为 3 次盒式模糊近似（O(1) 每像素 running sum），live 30fps 预算内。
+
+注意：blur 已进入本实现，从"本 spec 不做"清单移除。
+
 ## 本 spec 不做
 
-blur、squircle、双层方向性高光、Fresnel/内侧暗线、自适应阴影、明暗翻转、可读性 tint、内容裁切。留给 spec 2 / 3。
+squircle、双层方向性高光、Fresnel/内侧暗线、自适应阴影、明暗翻转、可读性 tint、内容裁切。留给 spec 2 / 3。

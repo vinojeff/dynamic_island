@@ -130,7 +130,14 @@ impl RawGlass {
     pub fn warp(&self, shape: GlassShape, luma: Option<f32>) -> Option<GlassBackdrop> {
         let shell = glass_optics::shell_rect(self.stage_width, shape, self.crop, self.image_scale);
         let bevel_px = glass_optics::bevel_width(shape) * self.image_scale;
-        let rgba = glass_optics::warp(&self.rgba, self.width, self.height, shell, bevel_px)?;
+        let rgba = glass_optics::warp(
+            &self.rgba,
+            self.width,
+            self.height,
+            shell,
+            bevel_px,
+            glass_optics::FACE_BLUR_SIGMA,
+        )?;
         let image = render_image_rgba(self.width, self.height, &rgba)?;
         Some(GlassBackdrop {
             image: Arc::new(image),

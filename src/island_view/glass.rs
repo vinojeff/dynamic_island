@@ -29,9 +29,9 @@ use crate::wallpaper;
 
 /// Width of the refraction rim, physical pixels. Flutter's `refractionWidth`.
 ///
-/// Three bands wide: a bright edge decomposing inward, which is what makes
-/// the silhouette read as a lens rather than a colored rectangle.
-pub(super) const REFRACTION_WIDTH: f32 = 4.0;
+/// The reference has no painted rim — its bright edge is refracted content —
+/// so this is a thin definition aid, not a band.
+pub(super) const REFRACTION_WIDTH: f32 = 3.0;
 
 /// How long one backdrop cross-fades into the next after a re-warp lands.
 pub(super) const GLASS_FADE_MS: u64 = 120;
@@ -72,9 +72,9 @@ pub(super) fn veil_alpha(luma: f32) -> f32 {
 #[must_use]
 pub(super) fn rim_alpha(band: usize) -> f32 {
     match band {
-        0 => 0.55,
-        1 => 0.20,
-        2 => 0.08,
+        0 => 0.40,
+        1 => 0.14,
+        2 => 0.05,
         _ => 0.0,
     }
 }
@@ -87,9 +87,9 @@ pub(super) fn rim_alpha(band: usize) -> f32 {
 pub(super) fn shell_shadows() -> Vec<BoxShadow> {
     vec![
         BoxShadow {
-            color: hsla(0.0, 0.0, 0.0, 0.30),
-            offset: point(px(0.0), px(14.0)),
-            blur_radius: px(44.0),
+            color: hsla(0.0, 0.0, 0.0, 0.25),
+            offset: point(px(0.0), px(20.0)),
+            blur_radius: px(48.0),
             spread_radius: px(0.0),
             inset: false,
         },
@@ -244,11 +244,12 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
     let shape = div().absolute().inset_0().rounded(px(radius));
     let scrim = if seeded {
         let top = veil_alpha(luma);
-        let bottom = (top + 0.04).min(0.21);
+        let bottom = (top + 0.05).min(0.2);
         shape.bg(linear_gradient(
             180.0,
-            linear_color_stop(hsla(GLASS_HUE, 0.14, 0.98, top), 0.0),
-            linear_color_stop(hsla(GLASS_HUE, 0.09, 0.92, bottom), 1.0),
+            // The reference tint is a neutral white → gray vertical gradient.
+            linear_color_stop(hsla(0.0, 0.0, 1.0, top), 0.0),
+            linear_color_stop(hsla(0.0, 0.0, 0.82, bottom), 1.0),
         ))
     } else {
         shape.bg(linear_gradient(
@@ -267,7 +268,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .rounded(px(radius))
         .bg(linear_gradient(
             SPECULAR_ANGLE,
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.07), 0.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.04), 0.0),
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
         ));
     let sheen_low = div()
@@ -277,7 +278,7 @@ pub(super) fn layers(radius: f32, glass: Option<(&Arc<RenderImage>, f32)>) -> Ve
         .bg(linear_gradient(
             SPECULAR_ANGLE,
             linear_color_stop(hsla(0.0, 1.0, 1.0, 0.0), 0.5),
-            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.03), 1.0),
+            linear_color_stop(hsla(0.0, 1.0, 1.0, 0.02), 1.0),
         ));
     // Same auto-size trap as the lens: without `size_full` the canvas is
     // zero-high and every `paint_ring` band fails its size guard.
@@ -455,7 +456,7 @@ mod tests {
 
     #[test]
     fn rim_alpha_falls_off_inward_and_exactly_bright_at_edge() {
-        assert_eq!(rim_alpha(0), 0.55, "the edge is the Fresnel peak");
+        assert_eq!(rim_alpha(0), 0.40, "the edge is the Fresnel peak");
         assert!(rim_alpha(0) > rim_alpha(1) && rim_alpha(1) > rim_alpha(2));
         assert_eq!(rim_alpha(RIM_BANDS), 0.0, "beyond the rim: nothing");
     }

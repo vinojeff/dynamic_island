@@ -133,19 +133,21 @@ const BEVEL_POWER: f32 = 4.0;
 const REFRACTIVE_INDEX: f32 = 1.5;
 /// Fraction of the bevel where the inner-edge taper starts.
 const TAPER_START: f32 = 0.75;
-/// Extra bend at the 45° corner, on top of the base Snell bend.
-pub(crate) const CORNER_BOOST: f32 = 0.30;
+/// Extra bend at the 45° corner, on top of the base Snell bend. The
+/// reference demo boosts corners to roughly the edge pull's magnitude.
+pub(crate) const CORNER_BOOST: f32 = 0.50;
 /// `depth / bevel`: how deep into the band the pull reaches.
 const DEPTH_FACTOR: f32 = 0.8;
 /// Max growth of the sample offset between adjacent pixels, in image pixels.
 ///
-/// A single bilinear tap shrinks ~2:1 cleanly. The raw Snell profile has a
-/// vertical wall at the silhouette — its slope diverges like `e^(-3/4)`, an
-/// ~11:1 minification that reads as jaggies — so the LUT integrates the
-/// profile with its slope capped: it follows Snell wherever that curve is
-/// gentle enough and rides a fixed cap line where it is not. The edge pull
-/// itself is untouched; the visibly bending band just gets longer and smooth.
-const MAX_SAMPLE_STEP: f32 = 2.0;
+/// The face blur (σ2.5, matching the reference's `blurRadius 5`) suppresses
+/// minification aliasing, so the profile can ride a steeper cap line and
+/// keep the punchy edge the reference has. Without the blur this must stay
+/// ≤ 2 or the edge aliases into jaggies.
+const MAX_SAMPLE_STEP: f32 = 4.0;
+/// Gaussian-approximating blur over the whole face before the warp, in
+/// pixels — the reference demo's `blurRadius 5` translates to σ2.5.
+pub const FACE_BLUR_SIGMA: f32 = 2.5;
 
 /// `tan(θi - θt)` for a surface slope `dh/dd`, air → glass. A vertical wall
 /// (`INFINITY`) saturates at `sqrt(n²-1)`.
@@ -236,6 +238,103 @@ pub fn bend_lut() -> [f32; BEND_STEPS] {
 #[must_use]
 pub fn corner_term(n: (f32, f32)) -> f32 {
     4.0 * n.0 * n.0 * n.1 * n.1
+}
+
+/// Three clamped-edge box passes approximate a Gaussian of `sigma` — the
+/// reference demo blurs the whole face (σ2.5) before anything else, which is
+/// where its softness lives. In-place, O(1) per pixel via running sums.
+pub fn blur(rgba: &mut [u8], width: usize, height: usize, sigma: f32) {
+    if width == 0 || height == 0 || rgba.len() != width * height * 4 || sigma <= 0.0 || sigma.is_nan()
+    {
+        return;
+    }
+    // Three box passes of radius r approximate sigma ≈ sqrt(r(r+1)).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "sigma is a small constant; the radius rounds to 2"
+    )]
+    let radius = ((sigma * 0.577 + 0.5) as usize).max(1);
+    let mut temp = vec![0u8; rgba.len()];
+    for _ in 0..3 {
+        box_pass(rgba, &mut temp, width, height, radius, true);
+        box_pass(&temp, rgba, width, height, radius, false);
+    }
+}
+
+/// One clamped-edge box pass over rows (`horizontal`) or columns. The running
+/// window sum keeps every pixel O(1); out-of-range steps clamp to the border.
+fn box_pass(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    horizontal: bool,
+) {
+    let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
+    if lines == 0 || line_len == 0 {
+        return;
+    }
+    let last = line_len - 1;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the window is 5 taps; the conversion is exact in u32 range"
+    )]
+    let window = (2 * radius + 1) as u32;
+    fn add_pixel(src: &[u8], base: usize, sums: &mut [u32; 4]) {
+        if let Some(tap) = src.get(base..base + 4) {
+            for (sum, value) in sums.iter_mut().zip(tap) {
+                *sum += u32::from(*value);
+            }
+        }
+    }
+    fn sub_pixel(src: &[u8], base: usize, sums: &mut [u32; 4]) {
+        if let Some(tap) = src.get(base..base + 4) {
+            for (sum, value) in sums.iter_mut().zip(tap) {
+                *sum -= u32::from(*value);
+            }
+        }
+    }
+    for line in 0..lines {
+        let base_of = |i: usize| {
+            if horizontal {
+                (line * width + i) * 4
+            } else {
+                (i * width + line) * 4
+            }
+        };
+        let mut sums = [0u32; 4];
+        // Seed the clamped window at i = 0: pixel 0 stands in for every
+        // out-of-range step, pixels 1..=radius follow.
+        for _ in 0..=radius {
+            add_pixel(src, base_of(0), &mut sums);
+        }
+        for j in 1..=radius.min(last) {
+            add_pixel(src, base_of(j), &mut sums);
+        }
+        for i in 0..line_len {
+            let pixel = [
+                (sums[0] / window) as u8,
+                (sums[1] / window) as u8,
+                (sums[2] / window) as u8,
+                (sums[3] / window) as u8,
+            ];
+            let out_base = base_of(i);
+            for (offset, value) in pixel.iter().enumerate() {
+                if let Some(slot) = dst.get_mut(out_base + offset) {
+                    *slot = *value;
+                }
+            }
+            // Slide the window toward i + 1: enter the right edge, leave the left.
+            if i + 1 < line_len {
+                add_pixel(src, base_of((i + 1 + radius).min(last)), &mut sums);
+                let leaving = (i as i32 - radius as i32).clamp(0, last as i32) as usize;
+                sub_pixel(src, base_of(leaving), &mut sums);
+            }
+        }
+    }
 }
 
 /// Sample offset for one output pixel, in image pixels. `None` copies the
@@ -342,9 +441,10 @@ pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect)
 /// Fraction of the bend used to spread R/G/B sample positions.
 pub const DISPERSION: f32 = 0.03;
 
-/// One CPU resampling pass: the bevel band is displaced along the SDF
-/// normal, R/G/B sample slightly different positions for dispersion, and
-/// everything else is copied verbatim. Returns `None` when `src` does not
+/// One CPU resampling pass: the whole face is blurred (σ2.5, the reference
+/// demo's softness), then the bevel band is displaced along the SDF normal
+/// with R/G/B sampling slightly different positions for dispersion; the rest
+/// of the blurred face is kept verbatim. Returns `None` when `src` does not
 /// match `width * height * 4`.
 #[must_use]
 #[allow(
@@ -357,11 +457,14 @@ pub fn warp(
     height: usize,
     shell: Shell,
     bevel_px: f32,
+    blur_sigma: f32,
 ) -> Option<Vec<u8>> {
     if width == 0 || height == 0 || src.len() != width * height * 4 {
         return None;
     }
-    let mut out = src.to_vec();
+    let mut blurred = src.to_vec();
+    blur(&mut blurred, width, height, blur_sigma);
+    let mut out = blurred.clone();
     if bevel_px <= 0.0 || bevel_px.is_nan() {
         return Some(out);
     }
@@ -378,11 +481,16 @@ pub fn warp(
             let Some((bx, by)) = displacement(&lut, p, shell, bevel_px, margins) else {
                 continue;
             };
-            let red =
-                sample_bilinear(src, width, height, p.0 + bx * (1.0 - DISPERSION), p.1 + by * (1.0 - DISPERSION));
-            let green = sample_bilinear(src, width, height, p.0 + bx, p.1 + by);
+            let red = sample_bilinear(
+                &blurred,
+                width,
+                height,
+                p.0 + bx * (1.0 - DISPERSION),
+                p.1 + by * (1.0 - DISPERSION),
+            );
+            let green = sample_bilinear(&blurred, width, height, p.0 + bx, p.1 + by);
             let blue = sample_bilinear(
-                src,
+                &blurred,
                 width,
                 height,
                 p.0 + bx * (1.0 + DISPERSION),
@@ -587,7 +695,7 @@ mod tests {
         let (bx, by) =
             displacement(&bend_lut(), top_left_45(shell), shell, 36.0, even_margins()).unwrap();
         let len = (bx * bx + by * by).sqrt();
-        near(len, 0.8 * 36.0 * 1.3);
+        near(len, 0.8 * 36.0 * 1.5);
         let s = std::f32::consts::FRAC_1_SQRT_2;
         near(bx / len, -s);
         near(by / len, -s);
@@ -670,7 +778,7 @@ mod tests {
         let lut = bend_lut();
         for pair in lut.windows(2) {
             if let [a, b] = pair {
-                assert!(a - b <= 0.042, "the profile cliff is back: {a} -> {b} in one step");
+                assert!(a - b <= 0.082, "the profile cliff is back: {a} -> {b} in one step");
             }
         }
     }
@@ -765,7 +873,7 @@ mod tests {
     #[test]
     fn warp_keeps_the_center_and_the_margin_untouched() {
         let src = solid(100, 100, [10, 20, 30, 255]);
-        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
         assert_eq!(pixel(&out, 100, 50, 50), [10, 20, 30, 255]);
         assert_eq!(pixel(&out, 100, 2, 2), [10, 20, 30, 255]);
     }
@@ -783,7 +891,7 @@ mod tests {
                 }
             }
         }
-        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
         let edge = pixel(&out, 100, 50, 20);
         assert!(edge[0] > 200, "the top edge must sample the red margin: {edge:?}");
         assert!(edge[2] < 100, "the top edge must not stay blue: {edge:?}");
@@ -792,16 +900,50 @@ mod tests {
     #[test]
     fn warp_preserves_alpha() {
         let src = solid(100, 100, [10, 20, 30, 0]);
-        let out = warp(&src, 100, 100, small_shell(), 10.0).unwrap();
+        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
         assert_eq!(pixel(&out, 100, 50, 50)[3], 0);
         assert_eq!(pixel(&out, 100, 50, 20)[3], 0);
     }
 
     #[test]
     fn warp_rejects_a_size_mismatch_and_zero_bevel_copies() {
-        assert!(warp(&[0, 0, 0, 0], 2, 2, small_shell(), 4.0).is_none());
+        assert!(warp(&[0, 0, 0, 0], 2, 2, small_shell(), 4.0, 0.0).is_none());
         let src = solid(100, 100, [1, 2, 3, 255]);
-        let out = warp(&src, 100, 100, small_shell(), 0.0).unwrap();
+        let out = warp(&src, 100, 100, small_shell(), 0.0, 0.0).unwrap();
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn blur_keeps_a_uniform_face_and_dimensions() {
+        let mut buf = solid(10, 8, [40, 60, 80, 255]);
+        blur(&mut buf, 10, 8, 2.5);
+        assert_eq!(buf, solid(10, 8, [40, 60, 80, 255]));
+    }
+
+    #[test]
+    fn blur_softens_a_hard_step_without_touching_the_far_field() {
+        let mut buf = Vec::with_capacity(20 * 20 * 4);
+        for _y in 0..20 {
+            for x in 0..20 {
+                let value = if x < 10 { 0 } else { 255 };
+                buf.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        blur(&mut buf, 20, 20, 2.5);
+        let left = pixel(&buf, 20, 1, 10)[0];
+        let right = pixel(&buf, 20, 18, 10)[0];
+        assert!(left < 10, "the far field keeps black: {left}");
+        assert!(right > 245, "the far field keeps white: {right}");
+        let at_edge = pixel(&buf, 20, 10, 10)[0];
+        assert!(
+            (100..=160).contains(&at_edge),
+            "the step must soften toward the middle: {at_edge}"
+        );
+        let mut previous = pixel(&buf, 20, 4, 10)[0];
+        for x in 5..16 {
+            let value = pixel(&buf, 20, x, 10)[0];
+            assert!(value >= previous, "the ramp must be monotone at x={x}");
+            previous = value;
+        }
     }
 }
