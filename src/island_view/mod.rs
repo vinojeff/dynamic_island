@@ -42,6 +42,7 @@ use gpui_kit::{
     Window, div, ease_out_quint,
 };
 
+use crate::glass_optics::GlassShape;
 use crate::live_glass;
 use crate::pointer::{PointerWatch, ScreenPoint};
 use crate::toasts;
@@ -508,7 +509,8 @@ impl IslandView {
                 .background_executor()
                 .spawn(async move {
                     let screen = wallpaper::screen_size();
-                    wallpaper::build(screen, rect, scale)
+                    wallpaper::build_raw(screen, rect, scale)
+                        .and_then(|raw| raw.warp(GlassShape::ZERO, None))
                 })
                 .await;
             view.update(cx, |view, cx| {

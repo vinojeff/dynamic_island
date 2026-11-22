@@ -10,6 +10,7 @@
 //! feeds events and runs the returned [`Action`]; it never touches the capture
 //! thread.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
 };
 
+use crate::glass_optics::{GlassShape, Rect};
 use crate::wallpaper::{self, GlassBackdrop, REFRACTION_MARGIN};
 
 /// How the glass gets its pixels.
@@ -73,8 +75,8 @@ pub(crate) struct CropSpec {
     pub bottom: u32,
     /// Integer downsampling factor, 1..=3.
     pub factor: u32,
-    /// Logical margin around the stage, `(left, top, right, bottom)`.
-    pub pad: (f32, f32, f32, f32),
+    /// Crop rect in logical px relative to the window's top-left.
+    pub crop: Rect,
 }
 
 impl CropSpec {
@@ -84,7 +86,7 @@ impl CropSpec {
         right: 0,
         bottom: 0,
         factor: 1,
-        pad: (0.0, 0.0, 0.0, 0.0),
+        crop: Rect::ZERO,
     };
 }
 
@@ -146,14 +148,8 @@ pub(crate) fn crop_spec(
     if right <= left || bottom <= top {
         return None;
     }
-    #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
-    let pad = (
-        (sx - left) as f32 / scale,
-        (sy - top) as f32 / scale,
-        right.saturating_sub(sx + sw) as f32 / scale,
-        bottom.saturating_sub(sy + sh) as f32 / scale,
-    );
-    Some(CropSpec { left, top, right, bottom, factor, pad })
+    let crop = wallpaper::crop_rect(left, top, right, bottom, (stage.0, stage.1), scale);
+    Some(CropSpec { left, top, right, bottom, factor, crop })
 }
 
 /// Box-averages `factor x factor` blocks of an RGBA frame.
@@ -515,19 +511,24 @@ impl Machine {
 /// The newest captured frame, overwritten by the capture thread.
 #[derive(Default)]
 struct Sink {
-    latest: Mutex<Option<Arc<GlassBackdrop>>>,
+    latest: Mutex<Option<GlassBackdrop>>,
+    next_generation: AtomicU64,
 }
 
 impl Sink {
+    fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn publish(&self, frame: GlassBackdrop) {
         let mut slot = match self.latest.lock() {
             Ok(slot) => slot,
             Err(poison) => PoisonError::into_inner(poison),
         };
-        *slot = Some(Arc::new(frame));
+        *slot = Some(frame);
     }
 
-    fn take(&self) -> Option<Arc<GlassBackdrop>> {
+    fn take(&self) -> Option<GlassBackdrop> {
         match self.latest.lock() {
             Ok(mut slot) => slot.take(),
             Err(poison) => PoisonError::into_inner(poison).take(),
@@ -597,7 +598,15 @@ impl GraphicsCaptureApiHandler for LiveHandler {
             &rgba,
         )
         .ok_or(LiveError)?;
-        self.sink.publish(GlassBackdrop { image: Arc::new(image), luma, pad: spec.pad });
+        // Unwarped for now: the live warp lands with the CropGeometry split.
+        let generation = self.sink.next_generation();
+        self.sink.publish(GlassBackdrop {
+            image: Arc::new(image),
+            luma,
+            crop: spec.crop,
+            shape: GlassShape::ZERO,
+            generation,
+        });
         Ok(())
     }
 }
@@ -831,7 +840,9 @@ impl LiveGlass {
         let frame = Arc::new(GlassBackdrop {
             image: Arc::clone(&raw.image),
             luma,
-            pad: raw.pad,
+            crop: raw.crop,
+            shape: raw.shape,
+            generation: raw.generation,
         });
         (Some(frame), action)
     }
@@ -854,17 +865,20 @@ mod tests {
     #[test]
     fn crop_keeps_the_lens_margin() {
         let spec = crop_spec((100, 0, 420, 360), 1.0, (1920, 1080)).unwrap();
-        assert_eq!((spec.left, spec.top, spec.right, spec.bottom), (60, 0, 560, 400));
+        assert_eq!((spec.left, spec.top, spec.right, spec.bottom), (52, 0, 568, 408));
         assert_eq!(spec.factor, 1);
-        assert_eq!(spec.pad, (40.0, 0.0, 40.0, 40.0));
+        assert!((spec.crop.x - -48.0).abs() < 1e-4);
+        assert!((spec.crop.y - 0.0).abs() < 1e-4);
+        assert!((spec.crop.width - 516.0).abs() < 1e-4);
+        assert!((spec.crop.height - 408.0).abs() < 1e-4);
     }
 
     #[test]
     fn crop_clamps_at_screen_edges() {
         let left = crop_spec((0, 0, 420, 360), 1.0, (1920, 1080)).unwrap();
         assert_eq!(left.left, 0);
-        assert_eq!(left.pad.0, 0.0);
-        assert_eq!(left.pad.1, 0.0);
+        assert!(left.crop.x.abs() < 1e-6);
+        assert!(left.crop.y.abs() < 1e-6);
 
         assert!(crop_spec((2000, 0, 420, 360), 1.0, (1920, 1080)).is_none());
     }
@@ -875,7 +889,9 @@ mod tests {
         assert_eq!(spec.factor, 3);
         assert_eq!((spec.right - spec.left) % 3, 0);
         assert_eq!((spec.bottom - spec.top) % 3, 0);
-        assert_eq!(spec.pad, (30.0, 0.0, 40.0, 0.0));
+        // The stage starts 90 px in, so the crop reaches 30 px left of the window.
+        assert!((spec.crop.x - -30.0).abs() < 1e-4);
+        assert!((spec.crop.width - 498.0).abs() < 1e-4);
     }
 
     #[test]

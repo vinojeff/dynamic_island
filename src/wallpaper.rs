@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETDESKWALLPAPER, SystemParametersInfoW,
 };
 
-use crate::glass_optics::Rect;
+use crate::glass_optics::{self, GlassShape, Rect};
 
 /// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
 pub const SATURATION: f32 = 1.15;
@@ -79,21 +79,22 @@ impl WallpaperPosition {
 /// The edge lens samples the desktop *outside* the panel; the margin is the
 /// distance it can reach. Must exceed the warp's maximal reach
 /// (`0.8 * 36 * 1.3 + dispersion ≈ 38.6`).
-pub const REFRACTION_MARGIN: f32 = 40.0;
+pub const REFRACTION_MARGIN: f32 = 48.0;
 
-/// A wallpaper crop ready to bend. Built on the background executor and
-/// swapped into the view as one value.
+/// A wallpaper crop ready to bend. Built by `RawGlass::warp` and swapped
+/// into the view as one value.
 #[derive(Clone)]
 pub struct GlassBackdrop {
-    /// The crisp crop, one-to-one with the stage plus a lens margin.
+    /// The refracted crop, one-to-one with the stage plus a lens margin.
     pub image: Arc<RenderImage>,
     /// Mean lightness of the crop, 0.0 dark .. 1.0 bright. Drives the scrim.
     pub luma: f32,
-    /// Logical margin around the stage, `(left, top, right, bottom)`.
-    ///
-    /// Zero on a side where the stage touches a display edge, so the lens
-    /// knows it cannot sample past the screen.
-    pub pad: (f32, f32, f32, f32),
+    /// Crop rect in logical pixels relative to the window's top-left.
+    pub crop: Rect,
+    /// The logical shape the warp was baked for. `ZERO` means unwarped.
+    pub shape: GlassShape,
+    /// The `RawGlass` generation this image was built from.
+    pub generation: u64,
 }
 
 /// A decoded, saturated wallpaper crop that has not been refracted yet.
@@ -118,6 +119,27 @@ pub struct RawGlass {
     pub luma: f32,
     /// Bumped per static build and per captured live frame.
     pub generation: u64,
+}
+
+impl RawGlass {
+    /// Refracts the crop for `shape` into a paintable backdrop.
+    ///
+    /// `luma` overrides the raw lightness — the live path passes its smoothed
+    /// value so a re-warp does not snap the scrim.
+    #[must_use]
+    pub fn warp(&self, shape: GlassShape, luma: Option<f32>) -> Option<GlassBackdrop> {
+        let shell = glass_optics::shell_rect(self.stage_width, shape, self.crop, self.image_scale);
+        let bevel_px = glass_optics::bevel_width(shape) * self.image_scale;
+        let rgba = glass_optics::warp(&self.rgba, self.width, self.height, shell, bevel_px)?;
+        let image = render_image_rgba(self.width, self.height, &rgba)?;
+        Some(GlassBackdrop {
+            image: Arc::new(image),
+            luma: luma.unwrap_or(self.luma),
+            crop: self.crop,
+            shape,
+            generation: self.generation,
+        })
+    }
 }
 
 /// What makes the crop stale: the wallpaper file AND the stage rect.
@@ -262,77 +284,16 @@ pub fn screen_size() -> (u32, u32) {
     }
 }
 
-/// Builds the wallpaper crop for one stage rect.
-///
-/// Runs on the background executor only: a full decode plus resize costs
-/// hundreds of milliseconds. Any failure — unreadable file, undecodable
-/// bytes, degenerate rect — yields `None`, and the caller still records the
-/// fingerprint so a broken wallpaper does not re-trigger a decode every poll.
-#[must_use]
-pub fn build(
-    display: (u32, u32),
-    rect: (i32, i32, u32, u32),
-    scale: f32,
-) -> Option<GlassBackdrop> {
-    let fingerprint = fingerprint_now(rect)?;
-    if display.0 == 0 || display.1 == 0 || !scale.is_finite() || scale <= 0.0 {
-        return None;
-    }
-    let bytes = std::fs::read(&fingerprint.path).ok()?;
-    let wall = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?
-        .to_rgba8();
-    // Draw the wallpaper the way Windows does, then crop the stage *plus* a
-    // margin out of that display-sized canvas. The lens reads the margin to
-    // bend the desktop outside the panel into the rim.
-    let composed = compose(&wall, display, fingerprint.position);
-    let (sx, sy, sw, sh) = stage_crop((composed.width(), composed.height()), rect)?;
-    // Widening display-sized integers into f32 loses nothing that matters.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-    let margin = (REFRACTION_MARGIN * scale).round().max(0.0) as u32;
-    let left = sx.saturating_sub(margin);
-    let top = sy.saturating_sub(margin);
-    let right = (sx + sw + margin).min(composed.width());
-    let bottom = (sy + sh + margin).min(composed.height());
-    let w = right.saturating_sub(left);
-    let h = bottom.saturating_sub(top);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let mut crop_raw = image::imageops::crop_imm(&composed, left, top, w, h)
-        .to_image()
-        .into_raw();
-    let cw = w as usize;
-    let ch = h as usize;
-    saturate(&mut crop_raw, SATURATION);
-    let luma = mean_luma(&crop_raw);
-    let image = render_image_rgba(cw, ch, &crop_raw)?;
-    // The lens works in logical pixels; the pad is physical pixels / scale.
-    #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
-    let pad = (
-        (sx - left) as f32 / scale,
-        (sy - top) as f32 / scale,
-        (right - (sx + sw)) as f32 / scale,
-        (bottom - (sy + sh)) as f32 / scale,
-    );
-    Some(GlassBackdrop {
-        image: Arc::new(image),
-        luma,
-        pad,
-    })
-}
-
 /// Decodes the wallpaper and crops the stage plus a lens margin, without
 /// refracting anything.
 ///
-/// [`build_raw`] is the same pipeline as [`build`] but stops at the raw
-/// RGBA crop so the view can re-warp it for whatever shape is current.
-/// Like [`build`], it runs on the background executor only and yields `None`
-/// on any failure; the caller still records the fingerprint. The returned
-/// `generation` is 0 — the caller stamps its own before use.
+/// Runs on the background executor only: a full decode plus resize costs
+/// hundreds of milliseconds, and the view keeps the result around so a shape
+/// change can re-warp without touching the wallpaper again. Any failure —
+/// unreadable file, undecodable bytes, degenerate rect — yields `None`, and
+/// the caller still records the fingerprint so a broken wallpaper does not
+/// re-trigger a decode every poll. The returned `generation` is 0 — the
+/// caller stamps its own before use.
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -858,5 +819,35 @@ mod tests {
         // A window hanging 10 px off the left edge: the crop starts right of it.
         let r = crop_rect(0, 0, 458, 408, (-10, 0), 1.0);
         assert!((r.x - 10.0).abs() < 1e-4);
+    }
+
+    fn solid_rgba(width: usize, height: usize, rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for _ in 0..width * height {
+            out.extend_from_slice(&rgba);
+        }
+        out
+    }
+
+    #[test]
+    fn raw_glass_warp_carries_geometry_luma_and_generation() {
+        let raw = RawGlass {
+            rgba: solid_rgba(4, 4, [40, 50, 60, 255]),
+            width: 4,
+            height: 4,
+            crop: Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 },
+            image_scale: 1.0,
+            stage_width: 420.0,
+            luma: 0.4,
+            generation: 7,
+        };
+        let shape = GlassShape { width: 2.0, height: 2.0, radius: 1.0 };
+        let backdrop = raw.warp(shape, None).unwrap();
+        assert_eq!(backdrop.crop, raw.crop);
+        assert_eq!(backdrop.shape, shape);
+        assert_eq!(backdrop.generation, 7);
+        assert!((backdrop.luma - 0.4).abs() < 1e-6);
+        let overridden = raw.warp(shape, Some(0.9)).unwrap();
+        assert!((overridden.luma - 0.9).abs() < 1e-6);
     }
 }

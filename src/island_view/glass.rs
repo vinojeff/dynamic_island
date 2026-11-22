@@ -6,8 +6,8 @@
 //! | Flutter vocabulary | Here |
 //! | --- | --- |
 //! | blur (frost) | none: the crisp wallpaper crop [`lens`] bends |
-//! | refraction (index, width) | the whole-panel lens, [`paint_lens`] |
-//! | dispersion | warm/cool fringe halves riding the rim, [`DISPERSION`] |
+//! | refraction (index, width) | one CPU SDF warp baked into the crop, [`lens`] paints it once |
+//! | dispersion | R/G/B sample offsets inside the warp — [`glass_optics::DISPERSION`] |
 //! | specular (angle, spread) | the diagonal white streak, two stacked two-stop gradients |
 //! | saturation | boosted while cropping, [`crate::wallpaper::SATURATION`] |
 //! | adaptivity | the scrim follows the crop's luma, [`veil_alpha`] |
@@ -24,6 +24,7 @@ use gpui_kit::{
 
 use rustedge::island::{self, IslandState};
 
+use crate::glass_optics::{self, GlassShape, Rect};
 use crate::wallpaper;
 
 /// Width of the refraction rim, physical pixels. Flutter's `refractionWidth`.
@@ -31,11 +32,6 @@ use crate::wallpaper;
 /// Three bands wide: a bright edge decomposing inward, which is what makes
 /// the silhouette read as a lens rather than a colored rectangle.
 pub(super) const REFRACTION_WIDTH: f32 = 4.0;
-
-/// Horizontal split of the chromatic fringe, physical pixels. Flutter's
-/// `dispersion`. The warm fringe rides the outer half of the rim, the cool
-/// fringe the inner half.
-pub(super) const DISPERSION: f32 = 2.0;
 
 /// Diagonal direction of the specular streak, degrees clockwise from top.
 pub(super) const SPECULAR_ANGLE: f32 = 130.0;
@@ -50,98 +46,11 @@ pub(super) const IDLE_LUMA: f32 = 0.35;
 /// How many concentric bands the rim renders, bright rim inward.
 const RIM_BANDS: usize = 3;
 
-/// How many concentric bands the panel is drawn in.
-///
-/// The bands are much wider than the old 0.75px rim ones (the pull is spread
-/// over the whole panel now), but the displacement step between neighbours is
-/// `REFRACTION_PULL / LENS_RINGS` — under 0.6px, so no band reads as a jump.
-const LENS_RINGS: usize = 64;
-
-/// How far the wallpaper is pulled outward at the silhouette, logical pixels.
-///
-/// The pull tapers to zero at the centre, so the rim reads the desktop outside
-/// the panel while the middle stays put. That squeeze is what makes a lens
-/// read as thick glass rather than as a plain blur. Must stay under
-/// [`crate::wallpaper::REFRACTION_MARGIN`].
-const REFRACTION_PULL: f32 = 34.0;
-
 /// The milky veil a luma calls for. A dark wallpaper needs more milk so the
 /// dark ink stays readable; a bright wallpaper needs less so its color shows.
 #[must_use]
 pub(super) fn veil_alpha(luma: f32) -> f32 {
     (0.26 - 0.10 * luma).clamp(0.16, 0.26)
-}
-
-/// How far the lens reaches inside the silhouette: all the way to the middle
-/// of the shorter side, so the whole panel bends instead of just a rim.
-#[must_use]
-pub(super) fn refraction_depth(width: f32, height: f32) -> f32 {
-    width.min(height) / 2.0
-}
-
-/// Outward pull of the lens `inset` logical pixels inside the silhouette.
-///
-/// Maximal flush against the edge, zero at [`refraction_depth`] — the middle.
-/// The falloff is linear so neighbouring rings always differ by the same step
-/// and no band reads as a jump.
-#[must_use]
-pub(super) fn refraction_pull(inset: f32, depth: f32) -> f32 {
-    if depth <= 0.0 {
-        return 0.0;
-    }
-    let t = (1.0 - inset / depth).clamp(0.0, 1.0);
-    REFRACTION_PULL * t
-}
-
-/// Window rect that samples `pull` logical pixels outside the silhouette.
-///
-/// The stage rect is the crop's extent, so drawing it into a rect shrunk about
-/// the shell centre maps window `p` to wallpaper
-/// `anchor + (p - anchor) * w / (w - 2 * pull)`: the rim reads the desktop
-/// outside the panel and compresses it inward, which is how a thick glass edge
-/// bends the world. `pull` must stay under the crop's margin or the lens would
-/// run off the edge of the image; an axis that cannot afford it stays
-/// untouched while the other axis still bends.
-#[must_use]
-pub(super) fn lens_bounds(
-    stage: (f32, f32, f32, f32),
-    anchor: (f32, f32),
-    pull: (f32, f32),
-) -> (f32, f32, f32, f32) {
-    let (left, top, width, height) = stage;
-    let fx = shrink_factor(width, pull.0);
-    let fy = shrink_factor(height, pull.1);
-    if (fx - 1.0).abs() <= f32::EPSILON && (fy - 1.0).abs() <= f32::EPSILON {
-        return stage;
-    }
-    (
-        anchor.0 + (left - anchor.0) * fx,
-        anchor.1 + (top - anchor.1) * fy,
-        width * fx,
-        height * fy,
-    )
-}
-
-/// Scale that moves one axis `pull` inward at both ends, or sticks at 1.0 when
-/// the pull would collapse the axis.
-fn shrink_factor(span: f32, pull: f32) -> f32 {
-    if span <= 2.0 * pull {
-        1.0
-    } else {
-        (span - 2.0 * pull) / span
-    }
-}
-
-/// Horizontal amount the shell sits right of the window's left edge.
-///
-/// The root centers the shell, and the card spans the full stage, so the card
-/// lands at zero offset — exactly where the wallpaper behind it is.
-#[must_use]
-pub(super) fn shell_offset(shape_width: f32) -> f32 {
-    // Widening the u32 stage width into f32 loses nothing.
-    #[allow(clippy::cast_precision_loss)]
-    let offset = (island::STAGE_WIDTH as f32 - shape_width) / 2.0;
-    offset
 }
 
 /// Rim brightness by band: brightest flush against the edge, falling off
@@ -191,11 +100,10 @@ pub(super) fn shell_shadows() -> Vec<BoxShadow> {
 
 /// The refracted wallpaper under the shell, painted once at the root.
 ///
-/// The canvas spans the whole window so its bounds match the stage one-to-one;
-/// `paint_image` then clips to the shell's rounded rect, which is what carries
-/// the silhouette (gpui's overflow mask is a plain rectangle). Empty when
-/// tucked as the line or before the first build lands — the fallback wash in
-/// [`layers`] takes over.
+/// The crop is warped on the producer side (`RawGlass::warp`); this only
+/// clips the shell out of the crop's natural rect. Empty when tucked as the
+/// line or before the first build lands — the fallback wash in [`layers`]
+/// takes over.
 pub(super) fn lens(
     shape: island::Morph,
     state: IslandState,
@@ -211,9 +119,6 @@ pub(super) fn lens(
         return base;
     };
     let backdrop = Arc::clone(backdrop);
-    let width = shape.width;
-    let height = shape.height;
-    let radius = px(shape.radius);
     // `canvas()` defaults to an auto-sized box: in this block parent its
     // height collapses to zero and `paint_image` bails on an empty rect.
     // `size_full` is load-bearing, not decoration.
@@ -221,117 +126,50 @@ pub(super) fn lens(
         canvas(
             |_, _, _| (),
             move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut App| {
-                paint_lens(bounds, (width, height), radius, &backdrop, window);
+                paint_backdrop(bounds, shape, &backdrop, window);
             },
         )
         .size_full(),
     )
 }
 
-/// Paints the whole panel as one lens, one ring per [`LENS_RINGS`].
-///
-/// Ring `k` clips the shell inset by `k * step` and draws the crop shrunk
-/// about the shell centre by that ring's [`refraction_pull`], so the rim reads
-/// the wallpaper *outside* the panel and compresses it inward. The pull fades
-/// to nothing at the centre, so the warp spans the whole face and no flat
-/// frosted patch is left in the middle.
-fn paint_lens(
+/// One clipped draw: the current shell out of the (possibly stale-scaled)
+/// crop rect. A backdrop baked for an older shape is mapped from its own
+/// shell onto the current one so the old bevel rides the new edge instead of
+/// ghosting inside the panel.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "geometry floats: the values are window-sized, far under f32's 24-bit mantissa"
+)]
+fn paint_backdrop(
     bounds: Bounds<Pixels>,
-    (width, height): (f32, f32),
-    radius: Pixels,
+    morph: island::Morph,
     backdrop: &wallpaper::GlassBackdrop,
     window: &mut Window,
 ) {
-    let pad = backdrop.pad;
-    let shell = Bounds::new(
-        point(bounds.origin.x + px(shell_offset(width)), bounds.origin.y),
-        size(px(width), px(height)),
-    );
-    // The crop covers the stage plus the lens margin the builder kept.
-    let natural = Bounds::new(
-        point(bounds.origin.x - px(pad.0), bounds.origin.y - px(pad.1)),
-        size(
-            px(f32::from(bounds.size.width) + pad.0 + pad.2),
-            px(f32::from(bounds.size.height) + pad.1 + pad.3),
-        ),
-    );
-    let stage = (
-        f32::from(natural.origin.x),
-        f32::from(natural.origin.y),
-        f32::from(natural.size.width),
-        f32::from(natural.size.height),
-    );
-    let anchor = (
-        f32::from(shell.origin.x) + width / 2.0,
-        f32::from(shell.origin.y) + height / 2.0,
-    );
-    // A screen edge leaves no margin on that side, so the lens cannot reach
-    // past it; cap each axis by the least margin it actually has.
-    let reach = (
-        pad.0.min(pad.2).min(REFRACTION_PULL),
-        pad.1.min(pad.3).min(REFRACTION_PULL),
-    );
-    let depth = refraction_depth(width, height);
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "LENS_RINGS is 64; the quotient is exact in f32"
-    )]
-    let step = depth / LENS_RINGS as f32;
-    for ring in 0..LENS_RINGS {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "the ring index is a small integer"
-        )]
-        let inset = ring as f32 * step;
-        // `refraction_pull` is the full-strength figure; scale it by how far
-        // this panel may actually reach past its own edge.
-        let fade = refraction_pull(inset, depth) / REFRACTION_PULL;
-        let lean = (reach.0 * fade, reach.1 * fade);
-        paint_crop(
-            inset_shell(shell, inset),
-            bounds_from(lens_bounds(stage, anchor, lean)),
-            (radius - px(inset)).max(px(0.0)),
-            &backdrop.image,
-            window,
-        );
+    let stage_width = f32::from(bounds.size.width);
+    let shape = GlassShape::from(morph);
+    let (shell, natural) = glass_optics::crop_rects(stage_width, shape, backdrop.crop);
+    let mut image_rect = natural;
+    if backdrop.shape != shape && backdrop.shape.width > 0.0 && backdrop.shape.height > 0.0 {
+        let baked = glass_optics::crop_rects(stage_width, backdrop.shape, backdrop.crop);
+        image_rect = glass_optics::stale_image_bounds(natural, baked.0, shell);
     }
-}
-
-/// One clipped draw of the crop. The shell's own corner radius is reduced by
-/// the inset so every ring hugs the silhouette.
-fn paint_crop(
-    clip: Bounds<Pixels>,
-    image_bounds: Bounds<Pixels>,
-    radius: Pixels,
-    image: &Arc<RenderImage>,
-    window: &mut Window,
-) {
+    let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let _painted = window.paint_image(
-        clip,
-        image_bounds,
-        Corners::all(radius),
-        Arc::clone(image),
+        to_bounds(shell, origin),
+        to_bounds(image_rect, origin),
+        Corners::all(px(shape.radius)),
+        Arc::clone(&backdrop.image),
         0,
         false,
     );
 }
 
-/// Shrinks the shell by `inset` on every side, never past zero.
-fn inset_shell(shell: Bounds<Pixels>, inset: f32) -> Bounds<Pixels> {
-    let width = (f32::from(shell.size.width) - 2.0 * inset).max(0.0);
-    let height = (f32::from(shell.size.height) - 2.0 * inset).max(0.0);
+fn to_bounds(rect: Rect, origin: (f32, f32)) -> Bounds<Pixels> {
     Bounds::new(
-        point(shell.origin.x + px(inset), shell.origin.y + px(inset)),
-        size(px(width), px(height)),
-    )
-}
-
-/// Converts the float rect from [`scaled_about`] back into window bounds.
-fn bounds_from(rect: (f32, f32, f32, f32)) -> Bounds<Pixels> {
-    let (left, top, width, height) = rect;
-    Bounds::new(
-        point(px(left), px(top)),
-        size(px(width.max(0.0)), px(height.max(0.0))),
+        point(px(origin.0 + rect.x), px(origin.1 + rect.y)),
+        size(px(rect.width.max(0.0)), px(rect.height.max(0.0))),
     )
 }
 
@@ -426,24 +264,6 @@ fn paint_rim(bounds: Bounds<Pixels>, radius: f32, window: &mut Window) {
             window,
         );
     }
-    // The dispersion: the red end of real glass rides the outer rim half, the
-    // blue end the inner half. Faint by design.
-    paint_ring(
-        bounds,
-        0.0,
-        DISPERSION,
-        radius,
-        hsla(0.98, 0.80, 0.60, 0.09),
-        window,
-    );
-    paint_ring(
-        bounds,
-        DISPERSION,
-        DISPERSION,
-        radius,
-        hsla(0.56, 0.80, 0.60, 0.09),
-        window,
-    );
 }
 
 /// Fills one ring band: `inset` from the edge, `band` thick, corner radii
@@ -544,9 +364,7 @@ mod tests {
 
     use gpui_kit::{IntoElement, ParentElement, Styled, div, point, px, size};
 
-    use rustedge::island::{
-        CARD_HEIGHT, CARD_RADIUS, CARD_WIDTH, PILL_WIDTH, STAGE_HEIGHT, STAGE_WIDTH,
-    };
+    use rustedge::island::{CARD_HEIGHT, CARD_RADIUS, CARD_WIDTH, STAGE_HEIGHT, STAGE_WIDTH};
 
     use super::*;
 
@@ -554,11 +372,12 @@ mod tests {
         let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
             image::RgbaImage::new(2, 2)
         )]));
-        let margin = wallpaper::REFRACTION_MARGIN;
         Arc::new(wallpaper::GlassBackdrop {
             image,
             luma: 0.5,
-            pad: (margin, margin, margin, margin),
+            crop: Rect { x: -48.0, y: -48.0, width: 516.0, height: 456.0 },
+            shape: GlassShape::ZERO,
+            generation: 0,
         })
     }
 
@@ -577,97 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn the_lens_pulls_hardest_at_the_edge_and_stops_at_the_depth() {
-        let depth = refraction_depth(CARD_WIDTH, CARD_HEIGHT);
-        assert_eq!(refraction_pull(0.0, depth), REFRACTION_PULL);
-        assert_eq!(refraction_pull(depth, depth), 0.0);
-        assert_eq!(
-            refraction_pull(depth * 2.0, depth),
-            0.0,
-            "past the depth the crop is untouched"
-        );
-        let mut inset = 0.0;
-        while inset < depth {
-            let next = (inset + 0.5).min(depth);
-            assert!(
-                refraction_pull(inset, depth) > refraction_pull(next, depth),
-                "the pull must fall off inward at {inset}"
-            );
-            inset = next;
-        }
-    }
-
-    #[test]
-    fn the_lens_reaches_the_centre_of_the_shorter_side() {
-        // The card is 420x288, so the lens runs 144px in from every edge and
-        // meets itself on the vertical centreline: no flat patch survives.
-        let depth = refraction_depth(CARD_WIDTH, CARD_HEIGHT);
-        near(depth, CARD_HEIGHT / 2.0);
-        // The innermost ring must still cover the centre point, and adjacent
-        // rings must differ by well under a pixel of displacement.
-        let step = depth / LENS_RINGS as f32;
-        let innermost = (LENS_RINGS - 1) as f32 * step;
-        assert!(
-            depth - innermost <= step + 1e-4,
-            "a gap would leave the centre unpainted"
-        );
-        assert!(
-            REFRACTION_PULL / (LENS_RINGS as f32) < 1.0,
-            "a ring step would read as a jump"
-        );
-        assert!(step > 0.0);
-    }
-
-    #[test]
-    fn the_lens_rect_samples_outside_the_silhouette() {
-        // The crop covers the stage plus the lens margin on every side.
-        let stage = (-26.0, -26.0, 472.0, 412.0);
-        let anchor = (210.0, 140.0);
-        let pull = (20.0, 20.0);
-        let (left, top, width, height) = lens_bounds(stage, anchor, pull);
-        // Shrinking about the anchor walks the drawn rect inward, which makes
-        // the rim read wallpaper from beyond the panel edge.
-        assert!(left > stage.0 && top > stage.1);
-        near(width, 432.0);
-        near(height, 372.0);
-        // The anchor maps onto itself.
-        near(left + (anchor.0 - stage.0) * (width / stage.2), anchor.0);
-        near(top + (anchor.1 - stage.1) * (height / stage.3), anchor.1);
-        // No pull means identity.
-        assert_eq!(lens_bounds(stage, anchor, (0.0, 0.0)), stage);
-        // A pull that would eat an axis is refused on that axis only, so the
-        // other one still bends.
-        let (left, top, width, height) = lens_bounds(stage, anchor, (300.0, 20.0));
-        near(left, stage.0);
-        near(width, stage.2);
-        assert!(top > stage.1 && height < stage.3);
-        // Both axes blocked: nothing to paint differently.
-        assert_eq!(lens_bounds(stage, anchor, (300.0, 300.0)), stage);
-    }
-
-    #[test]
-    fn shell_offset_centers_the_capsule_and_zeros_the_card() {
-        near(
-            shell_offset(PILL_WIDTH),
-            island::STAGE_WIDTH as f32 / 2.0 - PILL_WIDTH / 2.0,
-        );
-        near(shell_offset(CARD_WIDTH), 0.0);
-        // A mid-morph width stays symmetric about the center.
-        let mid = 320.0;
-        near(
-            island::STAGE_WIDTH as f32 / 2.0 - shell_offset(mid) - mid / 2.0,
-            shell_offset(mid) + mid / 2.0 - island::STAGE_WIDTH as f32 / 2.0,
-        );
-    }
-
-    #[test]
     fn rim_alpha_falls_off_inward_and_exactly_bright_at_edge() {
         assert_eq!(rim_alpha(0), 0.55, "the edge is the Fresnel peak");
         assert!(rim_alpha(0) > rim_alpha(1) && rim_alpha(1) > rim_alpha(2));
         assert_eq!(rim_alpha(RIM_BANDS), 0.0, "beyond the rim: nothing");
-        // `(STAGE_WIDTH − width)/2` centers any morph width.
-        let expected = (island::STAGE_WIDTH as f32 - 260.0) / 2.0;
-        near(shell_offset(260.0), expected);
     }
 
     /// The lens is painted from a canvas. A bare `canvas()` has an auto
@@ -733,9 +465,5 @@ mod tests {
             (height - CARD_HEIGHT).abs() < 0.01,
             "rim canvas height {height} does not fill the {CARD_HEIGHT}px shell"
         );
-    }
-
-    fn near(got: f32, want: f32) {
-        assert!((got - want).abs() < 1e-4, "{got} vs {want}");
     }
 }
