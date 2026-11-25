@@ -42,7 +42,7 @@ use gpui_kit::{
     Window, div, ease_out_quint,
 };
 
-use crate::glass_optics::GlassShape;
+use crate::glass_optics::{self, GlassShape};
 use crate::live_glass;
 use crate::pointer::{PointerWatch, ScreenPoint};
 use crate::toasts;
@@ -631,9 +631,21 @@ impl IslandView {
                     install = Some(backdrop);
                 }
                 if let Some(backdrop) = install {
-                    // Cross-fade from whatever is on screen; a fade-in from
-                    // nothing covers the first crop replacing the wash.
-                    self.fading_glass = self.glass.take().map(|old| (old, millis_now()));
+                    // Fade the new warp in only when it resolves a plain
+                    // fallback into the shape the shell has now: the old
+                    // backdrop was baked for another shape, so its plain crop
+                    // is on screen and blending the refraction over it hides
+                    // the cut. Two warps baked for the *same* shape are just
+                    // successive samples of the same glass — cross-fading
+                    // those would show the older sample for 120ms.
+                    let live = GlassShape::from(self.shown.shape.get());
+                    let old = self.glass.take();
+                    let old_plain = old
+                        .as_ref()
+                        .is_some_and(|old| !glass_optics::same_shape(old.shape, live));
+                    let resolves = glass_optics::same_shape(backdrop.shape, live) && old_plain;
+                    self.fading_glass =
+                        if resolves { old.map(|old| (old, millis_now())) } else { None };
                     self.glass_luma = backdrop.luma;
                     self.glass = Some(Arc::new(backdrop));
                     cx.notify();
@@ -679,20 +691,18 @@ impl IslandView {
             let Some(raw) = self.last_live_raw.clone() else {
                 return;
             };
-            let stale = self
-                .glass
-                .as_ref()
-                .is_none_or(|g| g.generation != raw.generation || g.shape != shape);
+            let stale = self.glass.as_ref().is_none_or(|g| {
+                g.generation != raw.generation || !glass_optics::same_shape(g.shape, shape)
+            });
             if stale {
                 self.request_warp(raw, shape, WarpDest::Live, cx);
             }
             return;
         }
         if let Some(raw) = self.static_raw.clone() {
-            let stale = self
-                .glass
-                .as_ref()
-                .is_none_or(|g| g.generation != raw.generation || g.shape != shape);
+            let stale = self.glass.as_ref().is_none_or(|g| {
+                g.generation != raw.generation || !glass_optics::same_shape(g.shape, shape)
+            });
             if stale {
                 self.request_warp(raw, shape, WarpDest::Static, cx);
             }

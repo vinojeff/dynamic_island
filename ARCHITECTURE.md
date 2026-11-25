@@ -441,9 +441,11 @@ The render path does not re-borrow the view.
 
 `glass` is the lens backdrop: the newest live frame while the capture is
 `Running`, otherwise the latest wallpaper crop. Both arrive as the same
-`GlassBackdrop` (`image`, `luma`, `crop`, `shape`, `generation`), so the lens
-never branches on the source. A warp that lagged a shape change is mapped from
-its baked shell onto the current one until the queue catches up.
+`GlassBackdrop` (`image`, `flat`, `luma`, `crop`, `shape`, `generation`), so the
+lens never branches on the source. A warp is only painted under the shape it
+was baked for; any other shape paints `flat`, the untouched crop, so a morph
+shows clear glass instead of the previous shape's stretched edge bands. A warp
+that matches the shell again fades in over that plain crop once.
 
 `paint_motion` builds the listeners, then `chrome::paint`:
 

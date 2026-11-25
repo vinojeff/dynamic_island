@@ -91,6 +91,16 @@ pub const REFRACTION_MARGIN: f32 = 128.0;
 pub struct GlassBackdrop {
     /// The refracted crop, one-to-one with the stage plus a lens margin.
     pub image: Arc<RenderImage>,
+    /// The same crop with no refraction, for shapes this warp was not baked
+    /// for.
+    ///
+    /// The displacement lives *inside* the baked shell, so a warp painted
+    /// under a different shell bends its content at the wrong place. Mapping
+    /// it onto the live shell (scaling the baked one to fit) only moves those
+    /// bands: the previous panel's edges stretch into a ghost across the new
+    /// one. This plain crop sits pixel-exact on the desktop instead, so a
+    /// morph reads as clear glass until a warp for the live shape lands.
+    pub flat: Arc<RenderImage>,
     /// Mean lightness of the crop, 0.0 dark .. 1.0 bright. Drives the scrim.
     pub luma: f32,
     /// Crop rect in logical pixels relative to the window's top-left.
@@ -146,8 +156,13 @@ impl RawGlass {
             glass_optics::FACE_BLUR_SIGMA,
         )?;
         let image = render_image_rgba(self.width, self.height, &rgba)?;
+        // The refracted image is the blurred crop with its edge band bent;
+        // outside the shell the two agree. The plain crop is the fallback for
+        // every other shape, so it stays untouched.
+        let flat = render_image_rgba(self.width, self.height, &self.rgba)?;
         Some(GlassBackdrop {
             image: Arc::new(image),
+            flat: Arc::new(flat),
             luma: luma.unwrap_or(self.luma),
             crop: self.crop,
             shape,
@@ -868,6 +883,18 @@ mod tests {
         assert_eq!(backdrop.shape, shape);
         assert_eq!(backdrop.generation, 7);
         assert!((backdrop.luma - 0.4).abs() < 1e-6);
+        // The fallback twin is the untouched crop, not another warp: a stale
+        // shape must paint the desktop, never a scaled ghost.
+        let mut expected = raw.rgba.clone();
+        for pixel in expected.chunks_exact_mut(4) {
+            pixel.swap(0, 2); // the frame is BGRA
+        }
+        assert_eq!(
+            backdrop.flat.as_bytes(0),
+            Some(expected.as_slice()),
+            "the fallback image must be the plain crop"
+        );
+        assert!(!Arc::ptr_eq(&backdrop.flat, &backdrop.image), "two images, one warp");
         let overridden = raw.warp(shape, Some(0.9)).unwrap();
         assert!((overridden.luma - 0.9).abs() < 1e-6);
     }

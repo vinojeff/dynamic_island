@@ -26,7 +26,8 @@ use rustedge::island;
 use crate::glass_optics::{self, GlassShape, Rect};
 use crate::wallpaper;
 
-/// How long one backdrop cross-fades into the next after a re-warp lands.
+/// How long a matching warp takes to blend in over the plain fallback it
+/// replaces.
 pub(super) const GLASS_FADE_MS: u64 = 120;
 
 /// Below this shell height the wallpaper lens is fully faded out; the line
@@ -60,10 +61,13 @@ fn lens_opacity_for_height(height: f32) -> f32 {
 /// The refracted wallpaper under the shell, painted once at the root.
 ///
 /// The crop is warped on the producer side (`RawGlass::warp`); this only
-/// clips the shell out of the crop's natural rect. `fading` is the previous
-/// backdrop plus the cross-fade progress — the new warp blends over it so a
-/// landing never snaps. Empty when the opacity ramp or the fade says so; the
-/// fallback wash in [`layers`] takes over.
+/// clips the shell out of the crop's natural rect. A backdrop baked for a
+/// different shape paints its plain twin instead (see [`lens_image`]), so a
+/// morph never shows the previous shape's refraction. `fading` is the plain
+/// backdrop that a newly matching warp has just replaced, plus the cross-fade
+/// progress — the refraction blends in so the landing never snaps. Empty when
+/// the opacity ramp or the fade says so; the fallback wash in [`layers`] takes
+/// over.
 pub(super) fn lens(
     shape: island::Morph,
     backdrop: Option<&Arc<wallpaper::GlassBackdrop>>,
@@ -111,10 +115,18 @@ fn lens_canvas(
     )
 }
 
-/// One clipped draw: the current shell out of the (possibly stale-scaled)
-/// crop rect. A backdrop baked for an older shape is mapped from its own
-/// shell onto the current one so the old bevel rides the new edge instead of
-/// ghosting inside the panel.
+/// The image a backdrop contributes under `shape`.
+///
+/// A warp baked for `shape` is painted as-is. Any other shape gets the plain
+/// crop: the baked displacement would otherwise land at the old edge, and
+/// scaling the old shell onto the new one smears those bands across the
+/// panel — the ghost of the previous shape. The plain crop is the desktop, so
+/// a morph looks like clear glass until the matching warp lands.
+fn lens_image(backdrop: &wallpaper::GlassBackdrop, shape: GlassShape) -> &Arc<RenderImage> {
+    if glass_optics::same_shape(backdrop.shape, shape) { &backdrop.image } else { &backdrop.flat }
+}
+
+/// One clipped draw: the current shell out of the crop, in stage pixels.
 #[allow(
     clippy::cast_precision_loss,
     reason = "geometry floats: the values are window-sized, far under f32's 24-bit mantissa"
@@ -128,17 +140,12 @@ fn paint_backdrop(
     let stage_width = f32::from(bounds.size.width);
     let shape = GlassShape::from(morph);
     let (shell, natural) = glass_optics::crop_rects(stage_width, shape, backdrop.crop);
-    let mut image_rect = natural;
-    if backdrop.shape != shape && backdrop.shape.width > 0.0 && backdrop.shape.height > 0.0 {
-        let baked = glass_optics::crop_rects(stage_width, backdrop.shape, backdrop.crop);
-        image_rect = glass_optics::stale_image_bounds(natural, baked.0, shell);
-    }
     let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let _painted = window.paint_image(
         to_bounds(shell, origin),
-        to_bounds(image_rect, origin),
+        to_bounds(natural, origin),
         Corners::all(px(shape.radius)),
-        Arc::clone(&backdrop.image),
+        Arc::clone(lens_image(backdrop, shape)),
         0,
         false,
     );
@@ -200,8 +207,12 @@ mod tests {
         let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
             image::RgbaImage::new(2, 2)
         )]));
+        let flat = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]))
+        )]));
         Arc::new(wallpaper::GlassBackdrop {
             image,
+            flat,
             luma: 0.5,
             crop: Rect { x: -128.0, y: 0.0, width: 676.0, height: 616.0 },
             shape: GlassShape::ZERO,
@@ -235,6 +246,37 @@ mod tests {
         let mid = lens_opacity_for_height(10.0);
         assert!(mid > 0.3 && mid < 0.7, "the crossing blends, not cuts");
         assert!(lens_opacity_for_height(9.0) < lens_opacity_for_height(11.0));
+    }
+
+    /// Regression: a warp's displacement lives *inside* the shell it was baked
+    /// for. Painting that warp under a morphing shell used to scale the baked
+    /// panel onto the live one, which stretched the previous shape's edge
+    /// bands into a ghost across the panel. Every mismatch must fall back to
+    /// the plain crop, which sits pixel-exact on the desktop.
+    #[test]
+    fn a_warp_baked_for_another_shape_paints_the_plain_crop() {
+        let card = GlassShape::from(island::resting(IslandState::Card));
+        let capsule = GlassShape::from(island::resting(IslandState::Capsule));
+        assert_ne!(card, capsule, "the two states must differ for this test");
+        let mut baked = (*backdrop()).clone();
+        baked.shape = capsule;
+        assert!(
+            Arc::ptr_eq(lens_image(&baked, capsule), &baked.image),
+            "the baked shape paints its refraction"
+        );
+        assert!(
+            Arc::ptr_eq(lens_image(&baked, card), &baked.flat),
+            "a stale shape must paint the plain crop, never a scaled warp"
+        );
+        // An in-between morph frame is a mismatch too: any scaling moves the
+        // bands, so only a (sub-pixel) shape match may paint the warp.
+        let growing = GlassShape { width: 400.0, height: 200.0, radius: 22.0 };
+        assert!(Arc::ptr_eq(lens_image(&baked, growing), &baked.flat));
+        let nudged = GlassShape { width: capsule.width + 0.2, ..capsule };
+        assert!(
+            Arc::ptr_eq(lens_image(&baked, nudged), &baked.image),
+            "a sub-pixel difference is still this warp"
+        );
     }
 
     /// The lens is painted from a canvas. A bare `canvas()` has an auto

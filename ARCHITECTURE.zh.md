@@ -237,7 +237,7 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 
 `Render::render` 先造一个 `Face`，再调用 `paint_motion`。`face` 是快照：形状、当前页、通知队头（独占隐藏时压掉）、按拖动修正过的进度、经过 `seek_refused` 之后的 `seekable`，以及性能历史。绘制路径不再回头借用视图。
 
-`glass` 是透镜的底图：捕获处于 `Running` 时是最新实时帧，否则是最近一次壁纸切片。两者都以同样的 `GlassBackdrop`（`image`、`luma`、`crop`、`shape`、`generation`）出现，透镜的计算不区分来源。warp 落后于形状变化时，旧图按烘制时的 shell 映射到当前 shell，等队列追上来。
+`glass` 是透镜的底图：捕获处于 `Running` 时是最新实时帧，否则是最近一次壁纸切片。两者都以同样的 `GlassBackdrop`（`image`、`flat`、`luma`、`crop`、`shape`、`generation`）出现，透镜的计算不区分来源。只有按当前形状烘制的 warp 才会被画出来；其他形状改画 `flat`（未经折射的切片），所以变形过程中看到的是透明玻璃，而不是上一形状被拉伸的折射带。形状重新对上时，warp 会在 `flat` 上淡入一次。
 
 `paint_motion` 把监听器装好，然后进入 `chrome::paint`：
 

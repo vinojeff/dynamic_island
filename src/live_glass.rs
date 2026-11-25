@@ -919,6 +919,7 @@ impl LiveGlass {
         if let Some(warped) = frame.warped.take() {
             frame.warped = Some(Arc::new(GlassBackdrop {
                 image: Arc::clone(&warped.image),
+                flat: Arc::clone(&warped.flat),
                 luma: frame.luma,
                 crop: warped.crop,
                 shape: warped.shape,

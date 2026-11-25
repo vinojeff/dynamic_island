@@ -40,9 +40,31 @@ pub struct GlassShape {
 }
 
 impl GlassShape {
-    /// "No warp baked": `lens` treats a backdrop with this shape as an
-    /// unwarped crop.
+    /// "No warp baked". No live shell has a zero width or height, so a
+    /// backdrop carrying this shape never matches and always paints its plain
+    /// crop.
     pub const ZERO: Self = Self { width: 0.0, height: 0.0, radius: 0.0 };
+}
+
+/// Largest per-axis difference at which a warp still counts as baked for the
+/// live shell, logical pixels.
+///
+/// The edge band is a few pixels wide and its displacement decays
+/// exponentially, so a sub-pixel difference moves the refraction by less than
+/// a pixel. Anything larger must fall back to the plain crop: the baked bands
+/// would sit visibly inside or outside the live edge.
+pub const SHAPE_MATCH_EPSILON: f32 = 0.5;
+
+/// Whether a warp baked for `baked` can be painted under `live` as-is.
+///
+/// Exact equality is too strict: the morph interpolates, so the frame that
+/// finishes a morph can land a fraction of a pixel away from the resting
+/// shape the warp was requested for.
+#[must_use]
+pub fn same_shape(baked: GlassShape, live: GlassShape) -> bool {
+    (baked.width - live.width).abs() <= SHAPE_MATCH_EPSILON
+        && (baked.height - live.height).abs() <= SHAPE_MATCH_EPSILON
+        && (baked.radius - live.radius).abs() <= SHAPE_MATCH_EPSILON
 }
 
 impl From<rustedge::island::Morph> for GlassShape {
@@ -315,22 +337,6 @@ pub fn crop_rects(stage_width: f32, shape: GlassShape, crop: Rect) -> (Rect, Rec
     let offset = (stage_width - shape.width) / 2.0;
     let shell = Rect { x: offset, y: 0.0, width: shape.width, height: shape.height };
     (shell, crop)
-}
-
-/// Maps the crop's natural rect from the baked shell's frame onto the current
-/// shell's frame, axially. `lens` uses this while a warp for the new shape is
-/// still in flight, so the old bevel rides the new edge instead of ghosting
-/// inside the panel. Callers must pass a non-degenerate `baked_shell`.
-#[must_use]
-pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect) -> Rect {
-    let sx = current_shell.width / baked_shell.width;
-    let sy = current_shell.height / baked_shell.height;
-    Rect {
-        x: current_shell.x + (natural.x - baked_shell.x) * sx,
-        y: current_shell.y + (natural.y - baked_shell.y) * sy,
-        width: natural.width * sx,
-        height: natural.height * sy,
-    }
 }
 
 /// One CPU resampling pass: Gaussian-blur the whole crop (the reference blurs
@@ -623,20 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_image_bounds_maps_the_baked_shell_onto_the_current_one() {
-        let natural = Rect { x: -48.0, y: -48.0, width: 516.0, height: 456.0 };
-        let baked = Rect { x: 50.0, y: 0.0, width: 320.0, height: 56.0 };
-        let current = Rect { x: 0.0, y: 0.0, width: 420.0, height: 288.0 };
-        let image = stale_image_bounds(natural, baked, current);
-        let sx = 420.0 / 320.0;
-        let sy = 288.0 / 56.0;
-        near(image.x, (-48.0 - 50.0) * sx);
-        assert!((image.y - (-48.0 * sy)).abs() < 0.01);
-        near(image.width, 516.0 * sx);
-        assert!((image.height - 456.0 * sy).abs() < 0.01);
-        let same = stale_image_bounds(natural, current, current);
-        near(same.x, natural.x);
-        near(same.width, natural.width);
+    fn a_sub_pixel_shape_difference_still_matches_the_warp() {
+        let card = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
+        assert!(same_shape(card, card));
+        let nudged = GlassShape { width: 420.4, height: 288.0, radius: 24.0 };
+        assert!(same_shape(card, nudged), "a fraction of a pixel is invisible");
+        let moved = GlassShape { width: 424.0, height: 288.0, radius: 24.0 };
+        assert!(!same_shape(card, moved), "4px moves the baked bands");
+        assert!(!same_shape(GlassShape::ZERO, card), "no warp never matches");
     }
 
     fn solid(width: usize, height: usize, rgba: [u8; 4]) -> Vec<u8> {
