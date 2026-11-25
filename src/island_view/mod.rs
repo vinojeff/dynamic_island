@@ -55,7 +55,7 @@ use rustedge::island::{
 };
 use rustedge::volume::{self, Endpoint, VolumeCommand, VolumeState};
 
-/// The liquid-glass optics: lens underlay, scrim, sheen, rim, dispersion.
+/// The liquid-glass paint side: the warped crop, the boot wash, the shadow.
 mod glass;
 mod warp_queue;
 mod chrome;
@@ -98,8 +98,6 @@ struct Face {
     page_slide: f32,
     /// The refracted wallpaper crop, when a build has landed.
     glass: Option<std::sync::Arc<gpui_kit::RenderImage>>,
-    /// Lightness behind the glass; `glass::layers` turns it into scrim depth.
-    glass_luma: f32,
 }
 
 /// One morph already on screen, so the next animation knows where it starts.
@@ -1174,7 +1172,6 @@ impl IslandView {
             perf: self.perf.clone(),
             page_slide: self.page_slide,
             glass: self.glass.as_ref().map(|backdrop| Arc::clone(&backdrop.image)),
-            glass_luma: self.glass_luma,
         }
     }
 

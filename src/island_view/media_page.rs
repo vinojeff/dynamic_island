@@ -145,7 +145,7 @@ fn session_list(sessions: &[media::MediaSession], clicks: &CardClicks) -> gpui_k
         .w(px(140.0))
         .flex()
         .flex_col()
-        .bg(hsla(0.58, 0.06, 0.96, 0.94))
+        .bg(hsla(0.58, 0.08, 0.10, 0.92))
         .rounded(px(8.0))
         .p(px(6.0));
     for (index, session) in sessions.iter().enumerate() {

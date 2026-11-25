@@ -81,6 +81,8 @@ pub(crate) struct CropGeometry {
     pub image_scale: f32,
     /// Unclipped stage width in logical pixels.
     pub stage_width: f32,
+    /// Logical desktop size; the reference scales its intensity by it.
+    pub page: (f32, f32),
 }
 
 /// One physical crop of the primary monitor, plus the shape to bake.
@@ -104,6 +106,7 @@ impl CropSpec {
             crop: Rect::ZERO,
             image_scale: 1.0,
             stage_width: 0.0,
+            page: (0.0, 0.0),
         },
         shape: GlassShape::ZERO,
     };
@@ -155,7 +158,7 @@ pub(crate) fn crop_spec(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        reason = "48 logical pixels times a small DPI factor"
+        reason = "128 logical pixels times a small DPI factor"
     )]
     let margin = (REFRACTION_MARGIN * scale).round().max(0.0) as u32;
     let (sx, sy, sw, sh) = stage_on_screen(stage, screen)?;
@@ -179,8 +182,23 @@ pub(crate) fn crop_spec(
         reason = "pixel counts are far under f32's 24-bit mantissa"
     )]
     let stage_width = stage.2 as f32 / scale;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "screen pixel counts are far under f32's 24-bit mantissa"
+    )]
+    let page = (screen.0 as f32 / scale, screen.1 as f32 / scale);
     Some(CropSpec {
-        geometry: CropGeometry { left, top, right, bottom, factor, crop, image_scale, stage_width },
+        geometry: CropGeometry {
+            left,
+            top,
+            right,
+            bottom,
+            factor,
+            crop,
+            image_scale,
+            stage_width,
+            page,
+        },
         shape,
     })
 }
@@ -654,6 +672,7 @@ impl GraphicsCaptureApiHandler for LiveHandler {
             crop: spec.geometry.crop,
             image_scale: spec.geometry.image_scale,
             stage_width: spec.geometry.stage_width,
+            page: spec.geometry.page,
             luma,
             generation,
         });
@@ -935,6 +954,8 @@ mod tests {
         assert_eq!(spec.geometry.factor, 2);
         assert!((spec.geometry.image_scale - 1.0).abs() < 1e-6);
         assert!((spec.geometry.stage_width - 210.0).abs() < 1e-4);
+        assert!((spec.geometry.page.0 - 960.0).abs() < 1e-4);
+        assert!((spec.geometry.page.1 - 540.0).abs() < 1e-4);
         assert_eq!(spec.shape, card_shape());
     }
 
@@ -959,13 +980,13 @@ mod tests {
                 spec.geometry.right,
                 spec.geometry.bottom
             ),
-            (52, 0, 568, 408)
+            (0, 0, 648, 488)
         );
         assert_eq!(spec.geometry.factor, 1);
-        assert!((spec.geometry.crop.x - -48.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.x - -100.0).abs() < 1e-4);
         assert!((spec.geometry.crop.y - 0.0).abs() < 1e-4);
-        assert!((spec.geometry.crop.width - 516.0).abs() < 1e-4);
-        assert!((spec.geometry.crop.height - 408.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 648.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.height - 488.0).abs() < 1e-4);
     }
 
     #[test]
@@ -984,9 +1005,10 @@ mod tests {
         assert_eq!(spec.geometry.factor, 3);
         assert_eq!((spec.geometry.right - spec.geometry.left) % 3, 0);
         assert_eq!((spec.geometry.bottom - spec.geometry.top) % 3, 0);
-        // The stage starts 90 px in, so the crop reaches 30 px left of the window.
+        // The crop is clamped at the screen edge, 30 logical px left of the
+        // window; the margin would reach 128 px past the stage if it fit.
         assert!((spec.geometry.crop.x - -30.0).abs() < 1e-4);
-        assert!((spec.geometry.crop.width - 498.0).abs() < 1e-4);
+        assert!((spec.geometry.crop.width - 578.0).abs() < 1e-4);
     }
 
     #[test]

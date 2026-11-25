@@ -125,7 +125,7 @@ Dynamic Edge 是贴在屏幕顶部正中的 Windows 悬浮层。一个固定大�
 
 **预热。** arm 时岛还是细线，就先起一个会话。它缓存一帧，让第一次悬停立刻显示实时像素；拿到帧或 2 秒到期就停。预热期间展开会取消「拿到一帧就停」的行为，反复喂进来的 `wanted == false` 也不能在缓存填好之前把会话拆掉。
 
-**帧路径。** 处理器读取共享的裁剪描述，用 `buffer_crop` 从 D3D staging 缓冲里裁出区域，按因子做盒式平均，套用和壁纸路径相同的饱和度，测出平均亮度，用 `RawGlass::warp` 折射一次（圆角矩形 SDF 斜面 + Snell，见 `glass_optics`），再把 `LiveFrame { raw, warped }` 发布到 `Sink`。视图只在 `Running` 时取最新一帧，用 200ms 时间常数平滑亮度，装进 `glass` 并重绘，同时保留 `raw` 供只变形状时重 warp。`Stopping` 期间落地的帧直接丢掉。
+**帧路径。** 处理器读取共享的裁剪描述，用 `buffer_crop` 从 D3D staging 缓冲里裁出区域，按因子做盒式平均，套用和壁纸路径相同的饱和度，测出平均亮度，用 `RawGlass::warp` 折射一次（liquid-glass-js 参考模型：圆角矩形 SDF 上的指数边缘/边角/涟漪层，按页面像素位移，见 `glass_optics`），再把 `LiveFrame { raw, warped }` 发布到 `Sink`。视图只在 `Running` 时取最新一帧，用 200ms 时间常数平滑亮度，装进 `glass` 并重绘，同时保留 `raw` 供只变形状时重 warp。`Stopping` 期间落地的帧直接丢掉。
 
 **空闲开销。** Windows Graphics Capture 只在桌面变化时交付帧，`MinimumUpdateIntervalSettings::Custom(33ms)` 把速率压到约 30fps。静态桌面不产帧，收起的岛会拆掉会话，没有帧就不会重绘。
 

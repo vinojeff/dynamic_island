@@ -72,7 +72,7 @@ where
     let Face {
         shape, playing, tab, volume, volume_visible, bt_notice, state, notice, badge, media_line,
         media_playing, cover, progress, position_secs, duration_secs, track_hot, album_line,
-        transport, modes, sessions, seekable, sessions_open, perf, page_slide, glass, glass_luma,
+        transport, modes, sessions, seekable, sessions_open, perf, page_slide, glass,
     } = face.clone();
     let title = match notice.as_ref() {
         Some(item) => notice::marquee_text(item),
@@ -134,7 +134,6 @@ where
 
     // The liquid-glass shell: backdrop optics first (they sit under the body),
     // then the body, then the transport row for the media card.
-    let glass_pair = glass.as_ref().map(|image| (image, glass_luma));
     let shell = div()
         .w(px(shape.width))
         .h(px(shape.height))
@@ -146,7 +145,7 @@ where
         .when(state != IslandState::Line, |shell| {
             shell
                 .shadow(super::glass::shell_shadows())
-                .children(super::glass::layers(shape.radius, glass_pair))
+                .children(super::glass::layers(shape.radius, glass.as_ref()))
         })
         .child(body);
 

@@ -1,10 +1,32 @@
-//! Pure liquid-glass optics: a rounded-rect SDF, a bevel profile bent by
-//! Snell, and one CPU resampling pass that displaces pixels along the SDF
-//! normal.
+//! Pure liquid-glass optics: a rounded-rect SDF, the reference shader's
+//! exponential edge layers, and one CPU resampling pass that displaces the
+//! wallpaper crop along the SDF normal.
+//!
+//! The model is a faithful CPU port of the fragment shader in
+//! `dashersw/liquid-glass-js` (`container.js`) — the look this shell is
+//! matched against:
+//!
+//! 1. `d` is the positive inward distance from the silhouette, in logical
+//!    pixels.
+//! 2. Three exponential layers stack along the outward normal:
+//!    `edge = exp(-d * EDGE_DISTANCE) * EDGE_INTENSITY`,
+//!    `rim  = exp(-d * RIM_DISTANCE) * RIM_INTENSITY`, and (only while
+//!    [`CENTER_WARP`] is on) `base = (1 - exp(-d * BASE_DISTANCE)) *
+//!    BASE_INTENSITY`.
+//! 3. A corner term peaks within a few pixels of each rounded corner, and a
+//!    tangential ripple rides the rim gain (zero at the target settings).
+//! 4. The total intensity is added to *page* UV, so a wide page pulls farther
+//!    horizontally than vertically; the crop is at page scale, so the
+//!    displacement in crop pixels is `intensity * page * image_scale`.
+//! 5. The crop is Gaussian-blurred before sampling. The reference blurs the
+//!    same texture at the displaced coordinate; at its `blurRadius / 2` sigma
+//!    the two orders are indistinguishable. There is no painted rim, scrim,
+//!    sheen, or dispersion: the bright edge in the reference is refracted
+//!    content, not a decoration.
 //!
 //! `wallpaper::RawGlass` warps here before the image reaches GPUI, so the
-//! lens paints once and the UI thread never resamples. Nothing in this
-//! module touches GPUI or the window.
+//! lens paints once and the UI thread never resamples. Nothing in this module
+//! touches GPUI or the window.
 
 /// A logical shell shape: the island's width, height, and corner radius.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,28 +67,9 @@ pub struct Shell {
 }
 
 impl Shell {
-    fn center(&self) -> (f32, f32) {
-        (self.x + self.width / 2.0, self.y + self.height / 2.0)
-    }
-
     fn half(&self) -> (f32, f32) {
         (self.width / 2.0, self.height / 2.0)
     }
-}
-
-/// Available sampling distance from the shell edge to the image edge, in
-/// image pixels. `warp` derives it from the shell and the image bounds, so a
-/// centered capsule may still sample the stage interior beside it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Margins {
-    /// Distance from the shell's left edge to the image's left edge.
-    pub left: f32,
-    /// Distance from the shell's top edge to the image's top edge.
-    pub top: f32,
-    /// Distance from the shell's right edge to the image's right edge.
-    pub right: f32,
-    /// Distance from the shell's bottom edge to the image's bottom edge.
-    pub bottom: f32,
 }
 
 /// An axis-aligned rect in whatever frame the caller uses: image pixels for
@@ -104,300 +107,186 @@ pub fn sd_round_rect(p: (f32, f32), half: (f32, f32), radius: f32) -> f32 {
 #[must_use]
 pub fn sdf_normal(p: (f32, f32), half: (f32, f32), radius: f32) -> Option<(f32, f32)> {
     const EPS: f32 = 1.0;
-    let gx =
-        sd_round_rect((p.0 + EPS, p.1), half, radius) - sd_round_rect((p.0 - EPS, p.1), half, radius);
-    let gy =
-        sd_round_rect((p.0, p.1 + EPS), half, radius) - sd_round_rect((p.0, p.1 - EPS), half, radius);
+    let gx = sd_round_rect((p.0 + EPS, p.1), half, radius)
+        - sd_round_rect((p.0 - EPS, p.1), half, radius);
+    let gy = sd_round_rect((p.0, p.1 + EPS), half, radius)
+        - sd_round_rect((p.0, p.1 - EPS), half, radius);
     let len = (gx * gx + gy * gy).sqrt();
-    if len < 0.1 {
-        None
-    } else {
-        Some((gx / len, gy / len))
-    }
+    if len < 0.1 { None } else { Some((gx / len, gy / len)) }
 }
 
-/// Bevel band width for one shape, in logical pixels. Grows with the shorter
-/// side, clamps to a usable band, and never crosses the midline.
-#[must_use]
-pub fn bevel_width(shape: GlassShape) -> f32 {
-    let min = shape.width.min(shape.height);
-    (min * 0.18).clamp(10.0, 36.0).min(min / 2.0)
-}
-
-/// LUT resolution for the bend profile. 64 entries are far denser than the
-/// band reads.
-const BEND_STEPS: usize = 64;
-/// Superellipse exponent of the bevel height profile.
-const BEVEL_POWER: f32 = 4.0;
-/// Glass index of refraction, air → glass.
-const REFRACTIVE_INDEX: f32 = 1.5;
-/// Fraction of the bevel where the inner-edge taper starts.
-const TAPER_START: f32 = 0.75;
-/// Extra bend at the 45° corner, on top of the base Snell bend. The
-/// reference demo boosts corners to roughly the edge pull's magnitude.
-pub(crate) const CORNER_BOOST: f32 = 0.50;
-/// `depth / bevel`: how deep into the band the pull reaches.
-const DEPTH_FACTOR: f32 = 0.8;
-/// Max growth of the sample offset between adjacent pixels, in image pixels.
+/// Edge layer gain at the silhouette. The target screenshot's `edgeIntensity`.
+pub const EDGE_INTENSITY: f32 = 0.035;
+/// Edge layer falloff per logical pixel. `edgeDistance` in the reference.
+pub const EDGE_DISTANCE: f32 = 0.240;
+/// Rim layer gain. `0.0` in the target screenshot.
+pub const RIM_INTENSITY: f32 = 0.0;
+/// Rim layer falloff per logical pixel. `rimDistance` in the reference.
+pub const RIM_DISTANCE: f32 = 0.5;
+/// Center-warp gain. `baseIntensity` in the reference.
+pub const BASE_INTENSITY: f32 = 0.009;
+/// Center-warp growth per logical pixel. `baseDistance` in the reference.
+pub const BASE_DISTANCE: f32 = 0.16;
+/// Extra push within a few pixels of each corner. `cornerBoost`.
+pub const CORNER_BOOST: f32 = 0.018;
+/// Tangential ripple amplitude. `rippleEffect`.
+pub const RIPPLE_EFFECT: f32 = 0.06;
+/// The reference's "Enable Center Warp" is off in the target screenshot.
+pub const CENTER_WARP: bool = false;
+/// Gaussian sigma of the face blur, logical pixels.
 ///
-/// The face blur (σ2.5, matching the reference's `blurRadius 5`) suppresses
-/// minification aliasing, so the profile can ride a steeper cap line and
-/// keep the punchy edge the reference has. Without the blur this must stay
-/// ≤ 2 or the edge aliases into jaggies.
-const MAX_SAMPLE_STEP: f32 = 4.0;
-/// Gaussian-approximating blur over the whole face before the warp, in
-/// pixels — the reference demo's `blurRadius 5` translates to σ2.5.
-pub const FACE_BLUR_SIGMA: f32 = 2.5;
+/// The reference computing `sigma = blurRadius / 2`; the target screenshot's
+/// `blurRadius` is 1.0, so the face stays crisp and the softness lives in the
+/// edge displacement itself.
+pub const FACE_BLUR_SIGMA: f32 = 0.5;
 
-/// `tan(θi - θt)` for a surface slope `dh/dd`, air → glass. A vertical wall
-/// (`INFINITY`) saturates at `sqrt(n²-1)`.
-fn snell_bend(slope: f32) -> f32 {
-    let theta_i = slope.atan();
-    let sin_t = (theta_i.sin() / REFRACTIVE_INDEX).clamp(-1.0, 1.0);
-    (theta_i - sin_t.asin()).tan()
+/// Longest inward distance the edge layers can still bend anything.
+const REFRACTION_SPAN: f32 = 48.0;
+/// Corner falloff per logical pixel (reference `exp(-c * 0.3)`).
+const CORNER_DISTANCE: f32 = 0.3;
+/// Ripple frequency (reference `sin(distFromEdge * 25)`).
+const RIPPLE_FREQUENCY: f32 = 25.0;
+
+/// The unweighted edge falloff, shared by the ripple and the edge layer.
+fn edge_falloff(d: f32) -> f32 {
+    (-d * EDGE_DISTANCE).exp()
 }
 
-fn index_limit() -> f32 {
-    (REFRACTIVE_INDEX * REFRACTIVE_INDEX - 1.0).sqrt()
+/// The rim falloff, shared by the ripple and the rim layer.
+fn rim_falloff(d: f32) -> f32 {
+    (-d * RIM_DISTANCE).exp()
 }
 
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// The un-capped normalized Snell curve — the shape the LUT integrates.
-fn raw_bend(e: f32) -> f32 {
-    let e = e.clamp(0.0, 1.0);
-    if e >= 1.0 {
-        return 0.0;
-    }
-    let inward = 1.0 - e;
-    // dh/dd = (1-e)^(p-1) * (1-(1-e)^p)^(1/p - 1); e = 0 is a vertical wall.
-    let base = 1.0 - inward.powf(BEVEL_POWER);
-    let slope = if base <= 0.0 {
-        f32::INFINITY
-    } else {
-        inward.powf(BEVEL_POWER - 1.0) * base.powf(1.0 / BEVEL_POWER - 1.0)
-    };
-    let bend = snell_bend(slope) / index_limit();
-    bend * (1.0 - smoothstep(TAPER_START, 1.0, e))
-}
-
-/// The bend profile sampled once per warp pass.
+/// Sample displacement for one point, in **logical page pixels**.
 ///
-/// Integrated from `raw_bend` with the per-pixel sample step capped at
-/// [`MAX_SAMPLE_STEP`]; outside the cap the curve is the raw Snell shape, at
-/// the silhouette it rides the cap line. Reaches zero before the inner edge
-/// and stays there, which blends seamlessly into the copied center.
+/// `p` is relative to the shell's center in logical pixels. `None` copies the
+/// source pixel: outside the shell (more than a pixel), past
+/// [`REFRACTION_SPAN`], or on the medial axis.
 #[must_use]
-pub fn bend_lut() -> [f32; BEND_STEPS] {
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "BEND_STEPS is 64; the quotients are exact in f32"
-    )]
-    let dt = 1.0 / (BEND_STEPS - 1) as f32;
-    // Δoffset per pixel = depth·Δlut and Δd = bevel·dt, so capping the step
-    // at MAX_SAMPLE_STEP caps Δlut per entry at the quotient below.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "BEND_STEPS is 64; the quotient is exact in f32"
-    )]
-    let max_lut_step = MAX_SAMPLE_STEP / (DEPTH_FACTOR * (BEND_STEPS - 1) as f32);
-    let mut lut = [0.0; BEND_STEPS];
-    lut[0] = 1.0;
-    let mut remaining = 1.0;
-    for step in 1..BEND_STEPS {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "BEND_STEPS is 64; the conversions are exact in f32"
-        )]
-        let e = (step as f32 - 0.5) * dt;
-        // raw_bend decreases inward, so the drop between the neighbours is
-        // the positive quantity. Beyond the cap the profile rides the cap
-        // line; near the end it accelerates along the even split so the
-        // curve lands exactly on zero at the inner edge.
-        let raw_drop = (raw_bend(e - dt) - raw_bend(e + dt)) / (2.0 * dt) * dt;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "BEND_STEPS is 64; the quotient is exact in f32"
-        )]
-        let steps_left = (BEND_STEPS - step) as f32;
-        let descent = (raw_drop.max(remaining / steps_left)).min(max_lut_step);
-        let previous = lut.get(step - 1).copied().unwrap_or(1.0);
-        let value = (previous - descent).max(0.0);
-        if let Some(slot) = lut.get_mut(step) {
-            *slot = value;
-        }
-        remaining = (remaining - descent).max(0.0);
+fn refraction_offset(
+    p: (f32, f32),
+    half: (f32, f32),
+    radius: f32,
+    page: (f32, f32),
+) -> Option<(f32, f32)> {
+    let width = half.0 * 2.0;
+    let height = half.1 * 2.0;
+    let min_dim = width.min(height);
+    if min_dim <= 0.0 {
+        return None;
     }
-    lut
+    let d = -sd_round_rect(p, half, radius);
+    // Pixel centers sit half a pixel off the geometry: a center up to one
+    // pixel outside the silhouette still gets the silhouette's bend instead
+    // of leaving a gap under the antialiased mask.
+    if d < -1.0 || (!CENTER_WARP && d >= REFRACTION_SPAN) {
+        return None;
+    }
+    let d = d.max(0.0);
+    let normal = sdf_normal(p, half, radius)?;
+    let base = if CENTER_WARP { (1.0 - (-d * BASE_DISTANCE).exp()) * BASE_INTENSITY } else { 0.0 };
+    let rim = rim_falloff(d) * RIM_INTENSITY;
+    let push = edge_falloff(d) * EDGE_INTENSITY + rim + base;
+    // The reference measures the corner boost from the *farther* pair of
+    // edges: it is largest where both normalized distances are small.
+    let nx = ((p.0 + half.0).min(width - p.0 - half.0) / width).clamp(0.0, 0.5);
+    let ny = ((p.1 + half.1).min(height - p.1 - half.1) / height).clamp(0.0, 0.5);
+    let corner = (-(nx.max(ny) * min_dim) * CORNER_DISTANCE).exp() * CORNER_BOOST;
+    // The ripple rides the rim layer, so a zero rim gain means no ripple.
+    let ripple = (d / min_dim * RIPPLE_FREQUENCY).sin() * RIPPLE_EFFECT * rim;
+    // Outward normal for the layers, tangent for the ripple.
+    Some((
+        (normal.0 * (push + corner) - normal.1 * ripple) * page.0,
+        (normal.1 * (push + corner) + normal.0 * ripple) * page.1,
+    ))
 }
 
-/// Corner emphasis: `sin²(2θ)` — 0 on straight edges, 1 at the 45° point.
-#[must_use]
-pub fn corner_term(n: (f32, f32)) -> f32 {
-    4.0 * n.0 * n.0 * n.1 * n.1
-}
-
-/// Three clamped-edge box passes approximate a Gaussian of `sigma` — the
-/// reference demo blurs the whole face (σ2.5) before anything else, which is
-/// where its softness lives. In-place, O(1) per pixel via running sums.
-pub fn blur(rgba: &mut [u8], width: usize, height: usize, sigma: f32) {
-    if width == 0 || height == 0 || rgba.len() != width * height * 4 || sigma <= 0.0 || sigma.is_nan()
-    {
-        return;
-    }
-    // Three box passes of radius r approximate sigma ≈ sqrt(r(r+1)).
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "sigma is a small constant; the radius rounds to 2"
-    )]
-    let radius = ((sigma * 0.577 + 0.5) as usize).max(1);
-    let mut temp = vec![0u8; rgba.len()];
-    for _ in 0..3 {
-        box_pass(rgba, &mut temp, width, height, radius, true);
-        box_pass(&temp, rgba, width, height, radius, false);
-    }
-}
-
-/// One clamped-edge box pass over rows (`horizontal`) or columns. The running
-/// window sum keeps every pixel O(1); out-of-range steps clamp to the border.
+/// Gaussian blur of an RGBA buffer in place.
+///
+/// Separable and normalized; `sigma` is in image pixels. A gaussian this
+/// narrow is what keeps the reference's face crisp while the edge band is
+/// heavily displaced.
 #[allow(
+    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    reason = "the window division is 0..=255 by construction; window itself is a 5-tap count; pixel offsets are tiny"
+    reason = "the kernel is at most 49 taps and pixel counts are far under \
+              f32's 24-bit mantissa"
 )]
-fn box_pass(
+pub fn blur(rgba: &mut [u8], width: usize, height: usize, sigma: f32) {
+    const SCALE: u32 = 1 << 14;
+    if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+        return;
+    }
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return;
+    }
+    // Beyond sigma 8 the reference's 13x13 kernel has already saturated;
+    // capping keeps the tap count (and this loop) bounded.
+    let sigma = sigma.min(8.0);
+    let radius = (sigma * 3.0).ceil() as usize;
+    if radius == 0 {
+        return;
+    }
+    let denom = 2.0 * sigma * sigma;
+    let mut kernel = Vec::with_capacity(radius * 2 + 1);
+    for step in -(radius as i64)..=(radius as i64) {
+        let distance = step as f32;
+        let weight = (-(distance * distance) / denom).exp();
+        kernel.push((weight * SCALE as f32).round() as u32);
+    }
+    let total: u32 = kernel.iter().sum();
+    if total == 0 {
+        return;
+    }
+    let mut temp = vec![0u8; rgba.len()];
+    blur_pass(rgba, &mut temp, width, height, &kernel, total, true);
+    blur_pass(&temp, rgba, width, height, &kernel, total, false);
+}
+
+/// One separable pass: `horizontal` scans rows, else columns.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "the tap weight times u8 stays in u32; offsets are a few pixels"
+)]
+fn blur_pass(
     src: &[u8],
     dst: &mut [u8],
     width: usize,
     height: usize,
-    radius: usize,
+    kernel: &[u32],
+    total: u32,
     horizontal: bool,
 ) {
-    fn add_pixel(src: &[u8], base: usize, sums: &mut [u32; 4]) {
-        if let Some(tap) = src.get(base..base + 4) {
-            for (sum, value) in sums.iter_mut().zip(tap) {
-                *sum += u32::from(*value);
-            }
-        }
-    }
-    fn sub_pixel(src: &[u8], base: usize, sums: &mut [u32; 4]) {
-        if let Some(tap) = src.get(base..base + 4) {
-            for (sum, value) in sums.iter_mut().zip(tap) {
-                *sum -= u32::from(*value);
-            }
-        }
-    }
+    let radius = kernel.len() / 2;
     let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
-    if lines == 0 || line_len == 0 {
-        return;
-    }
-    let last = line_len - 1;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "the window is 5 taps; the conversion is exact in u32 range"
-    )]
-    let window = (2 * radius + 1) as u32;
+    let last = line_len.saturating_sub(1) as i64;
     for line in 0..lines {
-        let base_of = |i: usize| {
-            if horizontal {
-                (line * width + i) * 4
-            } else {
-                (i * width + line) * 4
-            }
-        };
-        let mut sums = [0u32; 4];
-        // Seed the clamped window at i = 0: pixel 0 stands in for every
-        // out-of-range step, pixels 1..=radius follow.
-        for _ in 0..=radius {
-            add_pixel(src, base_of(0), &mut sums);
-        }
-        for j in 1..=radius.min(last) {
-            add_pixel(src, base_of(j), &mut sums);
-        }
-        for i in 0..line_len {
-            let pixel = [
-                (sums[0] / window) as u8,
-                (sums[1] / window) as u8,
-                (sums[2] / window) as u8,
-                (sums[3] / window) as u8,
-            ];
-            let out_base = base_of(i);
-            for (offset, value) in pixel.iter().enumerate() {
-                if let Some(slot) = dst.get_mut(out_base + offset) {
-                    *slot = *value;
+        for index in 0..line_len {
+            let mut sums = [0u32; 4];
+            for (tap, weight) in kernel.iter().enumerate() {
+                let offset = tap as i64 - radius as i64;
+                let pos = (index as i64 + offset).clamp(0, last) as usize;
+                let (x, y) = if horizontal { (pos, line) } else { (line, pos) };
+                let base = (y * width + x) * 4;
+                if let Some(pixel) = src.get(base..base + 4) {
+                    for (sum, value) in sums.iter_mut().zip(pixel) {
+                        *sum += weight * u32::from(*value);
+                    }
                 }
             }
-            // Slide the window toward i + 1: enter the right edge, leave the left.
-            if i + 1 < line_len {
-                add_pixel(src, base_of((i + 1 + radius).min(last)), &mut sums);
-                let leaving = (i as i32 - radius as i32).clamp(0, last as i32) as usize;
-                sub_pixel(src, base_of(leaving), &mut sums);
+            let out_base =
+                if horizontal { (line * width + index) * 4 } else { (index * width + line) * 4 };
+            if let Some(pixel) = dst.get_mut(out_base..out_base + 4) {
+                for (channel, sum) in pixel.iter_mut().zip(sums) {
+                    *channel = ((sum + total / 2) / total) as u8;
+                }
             }
         }
     }
-}
-
-/// Sample offset for one output pixel, in image pixels. `None` copies the
-/// source pixel: clearly outside the shell (more than a pixel), past the
-/// bevel, or on the medial axis.
-#[must_use]
-pub fn displacement(
-    lut: &[f32; BEND_STEPS],
-    pixel: (f32, f32),
-    shell: Shell,
-    bevel_px: f32,
-    margins: Margins,
-) -> Option<(f32, f32)> {
-    if bevel_px <= 0.0 || bevel_px.is_nan() {
-        return None;
-    }
-    let center = shell.center();
-    let half = shell.half();
-    let local = (pixel.0 - center.0, pixel.1 - center.1);
-    let d = -sd_round_rect(local, half, shell.radius);
-    // Pixel centers sit half a pixel off the geometry, and the exact arc
-    // point carries float error, so centers up to a pixel outside the
-    // silhouette are still edge pixels: clamp them onto the silhouette
-    // instead of leaving a one-pixel gap in the band.
-    if d <= -1.0 || d >= bevel_px {
-        return None;
-    }
-    let d = d.max(0.0);
-    let normal = sdf_normal(local, half, shell.radius)?;
-    // Linear interpolation between LUT entries: nearest-neighbour lookup
-    // quantized the bend into visible micro-rings exactly where the profile
-    // is steepest.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "e is clamped to 0..=1 and BEND_STEPS is 64"
-    )]
-    let index = {
-        let x = e_of(d, bevel_px) * (BEND_STEPS - 1) as f32;
-        let index = x.floor() as usize;
-        let t = x - index as f32;
-        (index, t)
-    };
-    let (index, t) = index;
-    let low = lut.get(index).copied().unwrap_or(0.0);
-    let high = lut.get(index + 1).copied().unwrap_or(low);
-    let depth = DEPTH_FACTOR * bevel_px;
-    let bend = (low + (high - low) * t) * depth * (1.0 + CORNER_BOOST * corner_term(normal));
-    Some((
-        (normal.0 * bend).clamp(-margins.left, margins.right),
-        (normal.1 * bend).clamp(-margins.top, margins.bottom),
-    ))
-}
-
-fn e_of(d: f32, bevel_px: f32) -> f32 {
-    (d / bevel_px).clamp(0.0, 1.0)
 }
 
 /// The shell rect inside one crop, in image pixels.
@@ -444,69 +333,64 @@ pub fn stale_image_bounds(natural: Rect, baked_shell: Rect, current_shell: Rect)
     }
 }
 
-/// Fraction of the bend used to spread R/G/B sample positions.
-pub const DISPERSION: f32 = 0.03;
-
-/// One CPU resampling pass: the whole face is blurred (σ2.5, the reference
-/// demo's softness), then the bevel band is displaced along the SDF normal
-/// with R/G/B sampling slightly different positions for dispersion; the rest
-/// of the blurred face is kept verbatim. Returns `None` when `src` does not
-/// match `width * height * 4`.
+/// One CPU resampling pass: Gaussian-blur the whole crop (the reference blurs
+/// after displacement), then bend the edge band along the SDF normal. The
+/// rest of the blurred face is kept verbatim.
+///
+/// `shell` is in image pixels relative to the crop; `image_scale` is image
+/// pixels per logical pixel; `page` is the logical desktop size the reference
+/// multiplies its intensity by; `blur_sigma` is logical pixels. Returns `None`
+/// when the buffer or the scale is unusable.
 #[must_use]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "pixel counts are far under f32's 24-bit mantissa"
-)]
+#[allow(clippy::cast_precision_loss, reason = "pixel counts are far under f32's 24-bit mantissa")]
 pub fn warp(
     src: &[u8],
     width: usize,
     height: usize,
     shell: Shell,
-    bevel_px: f32,
+    image_scale: f32,
+    page: (f32, f32),
     blur_sigma: f32,
 ) -> Option<Vec<u8>> {
     if width == 0 || height == 0 || src.len() != width * height * 4 {
         return None;
     }
+    if !image_scale.is_finite() || image_scale <= 0.0 {
+        return None;
+    }
     let mut blurred = src.to_vec();
-    blur(&mut blurred, width, height, blur_sigma);
+    blur(&mut blurred, width, height, blur_sigma * image_scale);
     let mut out = blurred.clone();
-    if bevel_px <= 0.0 || bevel_px.is_nan() {
+    let half = shell.half();
+    if half.0 <= 0.0 || half.1 <= 0.0 {
         return Some(out);
     }
-    let margins = Margins {
-        left: shell.x.max(0.0),
-        top: shell.y.max(0.0),
-        right: (width as f32 - (shell.x + shell.width)).max(0.0),
-        bottom: (height as f32 - (shell.y + shell.height)).max(0.0),
-    };
-    let lut = bend_lut();
+    let inv = 1.0 / image_scale;
+    let half_logical = (half.0 * inv, half.1 * inv);
+    let radius = shell.radius * inv;
+    // The shell's center, not its top-left: `local` is centre-relative.
+    let center = (shell.x * inv + half_logical.0, shell.y * inv + half_logical.1);
+    let page = (page.0.abs(), page.1.abs());
     for (y, row) in out.chunks_exact_mut(width * 4).enumerate() {
         for (x, chunk) in row.chunks_exact_mut(4).enumerate() {
-            let p = (x as f32 + 0.5, y as f32 + 0.5);
-            let Some((bx, by)) = displacement(&lut, p, shell, bevel_px, margins) else {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let local = (px * inv - center.0, py * inv - center.1);
+            let Some((dx, dy)) = refraction_offset(local, half_logical, radius, page) else {
                 continue;
             };
-            let red = sample_bilinear(
+            let sample = sample_bilinear(
                 &blurred,
                 width,
                 height,
-                p.0 + bx * (1.0 - DISPERSION),
-                p.1 + by * (1.0 - DISPERSION),
-            );
-            let green = sample_bilinear(&blurred, width, height, p.0 + bx, p.1 + by);
-            let blue = sample_bilinear(
-                &blurred,
-                width,
-                height,
-                p.0 + bx * (1.0 + DISPERSION),
-                p.1 + by * (1.0 + DISPERSION),
+                px + dx * image_scale,
+                py + dy * image_scale,
             );
             if let [r, g, b, a] = chunk {
-                *r = red[0];
-                *g = green[1];
-                *b = blue[2];
-                *a = green[3];
+                *r = sample[0];
+                *g = sample[1];
+                *b = sample[2];
+                *a = sample[3];
             }
         }
     }
@@ -626,219 +510,121 @@ mod tests {
         assert!(sdf_normal((0.0, 0.0), half, 6.0).is_none());
     }
 
+    fn card_shell_offset(p: (f32, f32), page: (f32, f32)) -> Option<(f32, f32)> {
+        refraction_offset(p, HALF, RADIUS, page)
+    }
+
     #[test]
-    fn bevel_clamps_by_shape_size() {
-        let card = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
-        near(bevel_width(card), 36.0);
+    fn the_top_edge_pulls_up_by_the_page_height() {
+        let (dx, dy) = card_shell_offset((0.0, -HALF.1), (1600.0, 900.0)).unwrap();
+        near(dx, 0.0);
+        near(dy, -(EDGE_INTENSITY * 900.0));
+    }
+
+    #[test]
+    fn the_side_edges_pull_by_the_page_width() {
+        let (dx, dy) = card_shell_offset((-HALF.0, 0.0), (1600.0, 900.0)).unwrap();
+        near(dx, -(EDGE_INTENSITY * 1600.0));
+        near(dy, 0.0);
+        let (dx, dy) = card_shell_offset((HALF.0, 0.0), (1600.0, 900.0)).unwrap();
+        near(dx, EDGE_INTENSITY * 1600.0);
+        near(dy, 0.0);
+    }
+
+    #[test]
+    fn a_zero_rim_gain_turns_the_ripple_off() {
+        // The reference weights the ripple by the rim layer, so at the target
+        // settings (Rim 0.000) the tangential term must vanish and the side
+        // edge pulls straight out.
+        assert!(RIM_INTENSITY.abs() < f32::EPSILON);
+        let page = (1600.0, 900.0);
+        let (dx, dy) = card_shell_offset((-HALF.0, 0.0), page).unwrap();
+        assert!(dx.abs() > 1.0, "the edge still pulls");
+        near(dy, 0.0);
+    }
+
+    #[test]
+    fn the_edge_layer_falls_off_by_one_e_fold_every_edge_distance() {
+        let page = (1000.0, 1000.0);
+        let edge = card_shell_offset((0.0, -HALF.1), page).unwrap().1;
+        let one = card_shell_offset((0.0, -HALF.1 + 1.0 / EDGE_DISTANCE), page).unwrap().1;
+        assert!(one.abs() < edge.abs());
+        near(one / edge, (-1.0f32).exp());
+    }
+
+    #[test]
+    fn the_45_degree_corner_pushes_along_the_normal_and_is_boosted() {
+        let page = (1600.0, 900.0);
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let cx = HALF.0 - RADIUS;
+        let cy = HALF.1 - RADIUS;
+        let p = (-(cx + RADIUS * s), -(cy + RADIUS * s));
+        let (dx, dy) = card_shell_offset(p, page).unwrap();
+        // The reference adds the same intensity to page UV, so undo the
+        // per-axis page scale before checking the direction.
+        near(dx / page.0, dy / page.1);
+        assert!(dx / page.0 < 0.0);
+        // The corner term adds to the plain edge push.
+        let magnitude = (dx / page.0).hypot(dy / page.1);
+        assert!(magnitude > EDGE_INTENSITY, "corner boost is missing");
+    }
+
+    #[test]
+    fn the_center_and_the_far_field_are_copies() {
+        let page = (1600.0, 900.0);
+        assert!(card_shell_offset((0.0, 0.0), page).is_none());
+        let beyond = -HALF.1 + REFRACTION_SPAN + 0.5;
+        assert!(card_shell_offset((0.0, beyond), page).is_none());
+        assert!(card_shell_offset((0.0, -HALF.1 - 10.0), page).is_none());
+    }
+
+    #[test]
+    fn a_wider_page_pulls_farther() {
+        let narrow = card_shell_offset((-HALF.0, 0.0), (800.0, 900.0)).unwrap();
+        let wide = card_shell_offset((-HALF.0, 0.0), (1600.0, 900.0)).unwrap();
+        near(wide.0, narrow.0 * 2.0);
+    }
+
+    #[test]
+    fn crop_rects_centers_the_shell_and_returns_the_natural_crop() {
+        let shape = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
+        let crop = Rect { x: -48.0, y: 0.0, width: 516.0, height: 456.0 };
+        let (shell, natural) = crop_rects(420.0, shape, crop);
+        near(shell.x, 0.0);
+        near(shell.y, 0.0);
+        near(natural.width, 516.0);
         let capsule = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
-        assert!((bevel_width(capsule) - 10.08).abs() < 1e-3);
-        let thin = GlassShape { width: 100.0, height: 12.0, radius: 6.0 };
-        near(bevel_width(thin), 6.0);
-        let tiny = GlassShape { width: 8.0, height: 8.0, radius: 4.0 };
-        near(bevel_width(tiny), 4.0);
-    }
-
-    #[test]
-    fn snell_bend_matches_known_slopes() {
-        near(snell_bend(0.0), 0.0);
-        // slope 1: tan(45° - asin(sin45°/1.5)) ≈ 0.3034
-        assert!((snell_bend(1.0) - 0.3034).abs() < 2e-3);
-        // a vertical wall bends hardest: sqrt(n²-1)
-        near(snell_bend(f32::INFINITY), (1.5f32 * 1.5 - 1.0).sqrt());
-    }
-
-    #[test]
-    fn bend_runs_from_one_to_zero_and_falls_monotonically() {
-        let lut = bend_lut();
-        near(lut.first().copied().unwrap(), 1.0);
-        near(lut.last().copied().unwrap(), 0.0);
-        for pair in lut.windows(2) {
-            if let [a, b] = pair {
-                assert!(a >= b, "bend must not grow inward: {a} -> {b}");
-            }
-        }
-    }
-
-    #[test]
-    fn corner_term_peaks_at_45_degrees() {
-        near(corner_term((0.0, -1.0)), 0.0);
-        near(corner_term((1.0, 0.0)), 0.0);
-        let s = std::f32::consts::FRAC_1_SQRT_2;
-        near(corner_term((s, -s)), 1.0);
-        near(corner_term((0.5, -0.866_025_4)), 0.75);
-    }
-
-    fn card_shell() -> Shell {
-        Shell { x: 48.0, y: 48.0, width: 420.0, height: 288.0, radius: 24.0 }
-    }
-
-    fn even_margins() -> Margins {
-        Margins { left: 48.0, top: 48.0, right: 48.0, bottom: 48.0 }
-    }
-
-    fn top_left_45(shell: Shell) -> (f32, f32) {
-        let s = std::f32::consts::FRAC_1_SQRT_2;
-        let cx = shell.x + shell.width / 2.0;
-        let cy = shell.y + shell.height / 2.0;
-        let kx = cx - shell.width / 2.0 + shell.radius;
-        let ky = cy - shell.height / 2.0 + shell.radius;
-        (kx - shell.radius * s, ky - shell.radius * s)
-    }
-
-    #[test]
-    fn the_top_edge_pulls_straight_up_by_the_depth() {
-        let shell = card_shell();
-        let offset =
-            displacement(&bend_lut(), (shell.x + 210.0, shell.y), shell, 36.0, even_margins())
-                .unwrap();
-        near(offset.0, 0.0);
-        near(offset.1, -(0.8 * 36.0));
-    }
-
-    #[test]
-    fn the_45_degree_corner_pulls_along_the_normal_and_is_boosted() {
-        let shell = card_shell();
-        let (bx, by) =
-            displacement(&bend_lut(), top_left_45(shell), shell, 36.0, even_margins()).unwrap();
-        let len = (bx * bx + by * by).sqrt();
-        near(len, 0.8 * 36.0 * 1.5);
-        let s = std::f32::consts::FRAC_1_SQRT_2;
-        near(bx / len, -s);
-        near(by / len, -s);
-    }
-
-    #[test]
-    fn the_axis_clamp_spares_the_other_component() {
-        let shell = card_shell();
-        let margins = Margins { left: 0.0, top: 48.0, right: 48.0, bottom: 48.0 };
-        let (bx, by) = displacement(&bend_lut(), top_left_45(shell), shell, 36.0, margins).unwrap();
-        near(bx, 0.0);
-        assert!(by < -20.0, "the vertical bend must survive the x clamp: {by}");
-    }
-
-    #[test]
-    fn outside_and_center_pixels_are_copies() {
-        let shell = card_shell();
-        let lut = bend_lut();
-        let above = (shell.x + 210.0, shell.y - 10.0);
-        assert!(displacement(&lut, above, shell, 36.0, even_margins()).is_none());
-        let center = (shell.x + 210.0, shell.y + 144.0);
-        assert!(displacement(&lut, center, shell, 36.0, even_margins()).is_none());
-    }
-
-    #[test]
-    fn the_bend_never_reaches_past_the_margin() {
-        let shell = card_shell();
-        let lut = bend_lut();
-        let (bx, by) =
-            displacement(&lut, top_left_45(shell), shell, 36.0, even_margins()).unwrap();
-        assert!(bx.abs() <= 48.0 && by.abs() <= 48.0);
-    }
-
-    #[test]
-    fn tangent_and_midpoint_bend_alike_and_fall_off_inward() {
-        let shell = card_shell();
-        let lut = bend_lut();
-        let tangent =
-            displacement(&lut, (shell.x + 186.0, shell.y), shell, 36.0, even_margins()).unwrap();
-        let midpoint =
-            displacement(&lut, (shell.x + 210.0, shell.y), shell, 36.0, even_margins()).unwrap();
-        let tangent_len = (tangent.0 * tangent.0 + tangent.1 * tangent.1).sqrt();
-        let mid_len = (midpoint.0 * midpoint.0 + midpoint.1 * midpoint.1).sqrt();
-        assert!((tangent_len - mid_len).abs() < 0.1 * mid_len);
-        let inner =
-            displacement(&lut, (shell.x + 210.0, shell.y + 4.0), shell, 36.0, even_margins())
-                .unwrap();
-        let inner_len = (inner.0 * inner.0 + inner.1 * inner.1).sqrt();
-        assert!(inner_len < mid_len, "the bend must fall off inward");
-    }
-
-    #[test]
-    fn adjacent_rows_never_sample_more_than_two_pixels_apart() {
-        // Regression: the raw Snell profile has a vertical wall at the
-        // silhouette — the first LUT step moved the sample ~6px over half a
-        // pixel of inward distance, an 11:1 minification that bilinear cannot
-        // represent. The visible symptom was jaggies along the whole edge.
-        let shell = card_shell();
-        let lut = bend_lut();
-        let mut prev =
-            displacement(&lut, (shell.x + 210.0, shell.y), shell, 36.0, even_margins()).unwrap();
-        for row in 1..=12 {
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "row is 1..=12; the conversion is exact"
-            )]
-            let p = (shell.x + 210.0, shell.y + 0.5 * row as f32);
-            let cur = displacement(&lut, p, shell, 36.0, even_margins()).unwrap();
-            let step = ((cur.0 - prev.0).abs() + (cur.1 - prev.1).abs()).sqrt();
-            assert!(
-                step <= 2.2,
-                "row {row}: sample moved {step:.2}px between adjacent pixels"
-            );
-            prev = cur;
-        }
-    }
-
-    #[test]
-    fn the_lut_never_steps_more_than_the_slope_cap() {
-        let lut = bend_lut();
-        for pair in lut.windows(2) {
-            if let [a, b] = pair {
-                assert!(a - b <= 0.082, "the profile cliff is back: {a} -> {b} in one step");
-            }
-        }
-    }
-
-    fn card_shape() -> GlassShape {
-        GlassShape { width: 420.0, height: 288.0, radius: 24.0 }
-    }
-
-    fn capsule_shape() -> GlassShape {
-        GlassShape { width: 320.0, height: 56.0, radius: 28.0 }
-    }
-
-    fn stage_crop_rect() -> Rect {
-        Rect { x: -48.0, y: -48.0, width: 516.0, height: 456.0 }
+        let (shell, _) = crop_rects(420.0, capsule, crop);
+        near(shell.x, 50.0);
     }
 
     #[test]
     fn shell_rect_centers_the_card_and_offsets_the_capsule() {
-        let shell = shell_rect(420.0, card_shape(), stage_crop_rect(), 1.0);
+        let crop = Rect { x: -48.0, y: 0.0, width: 516.0, height: 456.0 };
+        let card = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
+        let shell = shell_rect(420.0, card, crop, 1.0);
         near(shell.x, 48.0);
-        near(shell.y, 48.0);
+        near(shell.y, 0.0);
         near(shell.width, 420.0);
         near(shell.radius, 24.0);
-        let shell = shell_rect(420.0, capsule_shape(), stage_crop_rect(), 1.25);
+        let capsule = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
+        let shell = shell_rect(420.0, capsule, crop, 1.25);
         near(shell.x, (50.0 + 48.0) * 1.25);
         near(shell.width, 400.0);
     }
 
     #[test]
     fn an_offscreen_window_shifts_the_shell_negative() {
-        // The window hangs 10 physical px off the left edge (scale 1): the
-        // crop starts 10 px right of the window origin.
         let crop = Rect { x: 10.0, y: 0.0, width: 458.0, height: 408.0 };
-        let shell = shell_rect(420.0, card_shape(), crop, 1.0);
+        let card = GlassShape { width: 420.0, height: 288.0, radius: 24.0 };
+        let shell = shell_rect(420.0, card, crop, 1.0);
         near(shell.x, -10.0);
         near(shell.y, 0.0);
     }
 
     #[test]
-    fn crop_rects_centers_the_shell_and_returns_the_natural_crop() {
-        let (shell, natural) = crop_rects(420.0, card_shape(), stage_crop_rect());
-        near(shell.x, 0.0);
-        near(shell.y, 0.0);
-        near(shell.width, 420.0);
-        near(natural.x, -48.0);
-        near(natural.width, 516.0);
-        let (shell, _) = crop_rects(420.0, capsule_shape(), stage_crop_rect());
-        near(shell.x, 50.0);
-        near(shell.y, 0.0);
-    }
-
-    #[test]
     fn stale_image_bounds_maps_the_baked_shell_onto_the_current_one() {
-        let natural = stage_crop_rect();
+        let natural = Rect { x: -48.0, y: -48.0, width: 516.0, height: 456.0 };
         let baked = Rect { x: 50.0, y: 0.0, width: 320.0, height: 56.0 };
         let current = Rect { x: 0.0, y: 0.0, width: 420.0, height: 288.0 };
         let image = stale_image_bounds(natural, baked, current);
@@ -848,7 +634,6 @@ mod tests {
         assert!((image.y - (-48.0 * sy)).abs() < 0.01);
         near(image.width, 516.0 * sx);
         assert!((image.height - 456.0 * sy).abs() < 0.01);
-        // Same shape: identity.
         let same = stale_image_bounds(natural, current, current);
         near(same.x, natural.x);
         near(same.width, natural.width);
@@ -872,57 +657,106 @@ mod tests {
         ]
     }
 
-    fn small_shell() -> Shell {
-        Shell { x: 20.0, y: 20.0, width: 60.0, height: 60.0, radius: 10.0 }
+    fn test_shell() -> Shell {
+        Shell { x: 20.0, y: 20.0, width: 80.0, height: 80.0, radius: 18.0 }
     }
+
+    const TEST_PAGE: (f32, f32) = (400.0, 400.0);
 
     #[test]
     fn warp_keeps_the_center_and_the_margin_untouched() {
-        let src = solid(100, 100, [10, 20, 30, 255]);
-        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
-        assert_eq!(pixel(&out, 100, 50, 50), [10, 20, 30, 255]);
-        assert_eq!(pixel(&out, 100, 2, 2), [10, 20, 30, 255]);
+        let src = solid(120, 120, [10, 20, 30, 255]);
+        let out = warp(&src, 120, 120, test_shell(), 1.0, TEST_PAGE, 0.0).unwrap();
+        assert_eq!(pixel(&out, 120, 60, 60), [10, 20, 30, 255]);
+        assert_eq!(pixel(&out, 120, 2, 2), [10, 20, 30, 255]);
     }
 
     #[test]
     fn warp_pulls_the_top_edge_from_above() {
-        let mut src = solid(100, 100, [0, 0, 255, 255]);
-        for row in src.chunks_exact_mut(100 * 4).take(20) {
+        let mut src = solid(120, 120, [0, 0, 255, 255]);
+        for row in src.chunks_exact_mut(120 * 4).take(20) {
             for chunk in row.chunks_exact_mut(4) {
-                if let [r, g, b, a] = chunk {
+                if let [r, _g, b, _a] = chunk {
                     *r = 255;
-                    *g = 0;
                     *b = 0;
-                    *a = 255;
                 }
             }
         }
-        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
-        let edge = pixel(&out, 100, 50, 20);
+        let out = warp(&src, 120, 120, test_shell(), 1.0, TEST_PAGE, 0.0).unwrap();
+        let edge = pixel(&out, 120, 60, 20);
         assert!(edge[0] > 200, "the top edge must sample the red margin: {edge:?}");
         assert!(edge[2] < 100, "the top edge must not stay blue: {edge:?}");
     }
 
     #[test]
-    fn warp_preserves_alpha() {
-        let src = solid(100, 100, [10, 20, 30, 0]);
-        let out = warp(&src, 100, 100, small_shell(), 10.0, 0.0).unwrap();
-        assert_eq!(pixel(&out, 100, 50, 50)[3], 0);
-        assert_eq!(pixel(&out, 100, 50, 20)[3], 0);
+    fn warp_pulls_the_left_edge_from_the_left() {
+        let mut src = solid(120, 120, [0, 0, 255, 255]);
+        for (index, chunk) in src.chunks_exact_mut(4).enumerate() {
+            if index % 120 < 20 {
+                if let [r, _g, b, _a] = chunk {
+                    *r = 255;
+                    *b = 0;
+                }
+            }
+        }
+        let out = warp(&src, 120, 120, test_shell(), 1.0, TEST_PAGE, 0.0).unwrap();
+        let edge = pixel(&out, 120, 20, 60);
+        assert!(edge[0] > 200, "the left edge must sample the red margin: {edge:?}");
+        assert!(edge[2] < 100, "the left edge must not stay blue: {edge:?}");
     }
 
     #[test]
-    fn warp_rejects_a_size_mismatch_and_zero_bevel_copies() {
-        assert!(warp(&[0, 0, 0, 0], 2, 2, small_shell(), 4.0, 0.0).is_none());
-        let src = solid(100, 100, [1, 2, 3, 255]);
-        let out = warp(&src, 100, 100, small_shell(), 0.0, 0.0).unwrap();
-        assert_eq!(out, src);
+    fn warp_clamps_at_the_crop_edge_instead_of_reading_out_of_bounds() {
+        // The shell sits flush against the crop's top, the screen-top case.
+        let shell = Shell { x: 0.0, y: 0.0, width: 80.0, height: 80.0, radius: 18.0 };
+        let mut src = solid(100, 100, [0, 0, 255, 255]);
+        for chunk in src.chunks_exact_mut(4).take(100 * 10) {
+            if let [r, _g, b, _a] = chunk {
+                *r = 255;
+                *b = 0;
+            }
+        }
+        let out = warp(&src, 100, 100, shell, 1.0, TEST_PAGE, 0.0).unwrap();
+        assert_eq!(pixel(&out, 100, 40, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn warp_preserves_alpha() {
+        let src = solid(120, 120, [10, 20, 30, 0]);
+        let out = warp(&src, 120, 120, test_shell(), 1.0, TEST_PAGE, 0.0).unwrap();
+        assert_eq!(pixel(&out, 120, 60, 60)[3], 0);
+        assert_eq!(pixel(&out, 120, 60, 20)[3], 0);
+    }
+
+    #[test]
+    fn warp_scales_the_pull_with_the_image_scale() {
+        // Same logical geometry at 2x: the crop is twice the pixels, so the
+        // displacement in image pixels must double as well.
+        let shell = Shell { x: 40.0, y: 40.0, width: 160.0, height: 160.0, radius: 36.0 };
+        let mut src = solid(240, 240, [0, 0, 255, 255]);
+        for row in src.chunks_exact_mut(240 * 4).take(40) {
+            for chunk in row.chunks_exact_mut(4) {
+                if let [r, _g, b, _a] = chunk {
+                    *r = 255;
+                    *b = 0;
+                }
+            }
+        }
+        let out = warp(&src, 240, 240, shell, 2.0, TEST_PAGE, 0.0).unwrap();
+        assert_eq!(pixel(&out, 240, 120, 40), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn warp_rejects_a_size_mismatch_or_a_bad_scale() {
+        assert!(warp(&[0, 0, 0, 0], 2, 2, test_shell(), 1.0, TEST_PAGE, 0.0).is_none());
+        let src = solid(120, 120, [1, 2, 3, 255]);
+        assert!(warp(&src, 120, 120, test_shell(), 0.0, TEST_PAGE, 0.0).is_none());
     }
 
     #[test]
     fn blur_keeps_a_uniform_face_and_dimensions() {
         let mut buf = solid(10, 8, [40, 60, 80, 255]);
-        blur(&mut buf, 10, 8, 2.5);
+        blur(&mut buf, 10, 8, 0.5);
         assert_eq!(buf, solid(10, 8, [40, 60, 80, 255]));
     }
 
@@ -935,14 +769,14 @@ mod tests {
                 buf.extend_from_slice(&[value, value, value, 255]);
             }
         }
-        blur(&mut buf, 20, 20, 2.5);
+        blur(&mut buf, 20, 20, 2.0);
         let left = pixel(&buf, 20, 1, 10)[0];
         let right = pixel(&buf, 20, 18, 10)[0];
         assert!(left < 10, "the far field keeps black: {left}");
         assert!(right > 245, "the far field keeps white: {right}");
         let at_edge = pixel(&buf, 20, 10, 10)[0];
         assert!(
-            (100..=160).contains(&at_edge),
+            (140..=170).contains(&at_edge),
             "the step must soften toward the middle: {at_edge}"
         );
         let mut previous = pixel(&buf, 20, 4, 10)[0];
@@ -951,5 +785,16 @@ mod tests {
             assert!(value >= previous, "the ramp must be monotone at x={x}");
             previous = value;
         }
+    }
+
+    #[test]
+    fn blur_ignores_a_zero_sigma_and_a_size_mismatch() {
+        let mut buf = solid(4, 4, [9, 9, 9, 255]);
+        let copy = buf.clone();
+        blur(&mut buf, 4, 4, 0.0);
+        assert_eq!(buf, copy);
+        let mut short = vec![0u8; 3];
+        blur(&mut short, 4, 4, 1.0);
+        assert_eq!(short, vec![0u8; 3]);
     }
 }

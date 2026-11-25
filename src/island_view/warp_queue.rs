@@ -154,6 +154,7 @@ mod tests {
             crop: Rect::ZERO,
             image_scale: 1.0,
             stage_width: 420.0,
+            page: (1600.0, 900.0),
             luma: 0.5,
             generation,
         })

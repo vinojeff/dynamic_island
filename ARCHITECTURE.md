@@ -226,7 +226,9 @@ tear the session down before the cache is filled.
 **Frame path.** The handler reads the shared spec, crops the D3D staging
 buffer with `buffer_crop`, box-averages it by the factor, applies the same
 saturation as the wallpaper path, measures mean luma, refracts the crop once
-with `RawGlass::warp` (rounded-rect SDF bevel + Snell, `glass_optics`), and
+with `RawGlass::warp` (the liquid-glass-js reference: exponential edge, rim,
+corner, and ripple layers over the rounded-rect SDF, displaced in page pixels,
+`glass_optics`), and
 publishes a `LiveFrame { raw, warped }` into `Sink`. The view takes the newest
 frame only while `Running`, smooths luma with a 200ms time constant, installs
 `warped` in `glass`, keeps `raw` for shape-only re-warps, and repaints. A

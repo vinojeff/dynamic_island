@@ -31,8 +31,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::glass_optics::{self, GlassShape, Rect};
 
-/// Saturation boost. iOS glass reads slightly richer than the raw wallpaper.
-pub const SATURATION: f32 = 1.15;
+/// Saturation applied to the crop. The reference shader samples the page
+/// unchanged, so the glass keeps the wallpaper's own color.
+pub const SATURATION: f32 = 1.0;
 
 /// How Windows places the wallpaper on the primary display.
 ///
@@ -76,10 +77,13 @@ impl WallpaperPosition {
 
 /// How much wallpaper the crop keeps around the stage, logical pixels.
 ///
-/// The edge lens samples the desktop *outside* the panel; the margin is the
-/// distance it can reach. Must exceed the warp's maximal reach
-/// (`0.8 * 36 * 1.3 + dispersion ≈ 38.6`).
-pub const REFRACTION_MARGIN: f32 = 48.0;
+/// The edge band samples the desktop *outside* the panel. The reference
+/// scales its displacement by the page size: on a 2560x1440 page the edge
+/// layer pulls `0.035 * 2560 ≈ 90` px sideways, and the corner term adds a
+/// diagonal push of about the same size. 128 covers both on a page up to
+/// roughly 3600 px wide; past that the sampler clamps to the crop, exactly
+/// as the reference clamps to the page edge.
+pub const REFRACTION_MARGIN: f32 = 128.0;
 
 /// A wallpaper crop ready to bend. Built by `RawGlass::warp` and swapped
 /// into the view as one value.
@@ -115,6 +119,9 @@ pub struct RawGlass {
     pub image_scale: f32,
     /// Unclipped stage width in logical pixels, for centering the shell.
     pub stage_width: f32,
+    /// Logical desktop size. The reference adds its intensity to a page UV,
+    /// so this is what turns the intensity into a pixel displacement.
+    pub page: (f32, f32),
     /// Mean lightness of the crop, 0.0 dark .. 1.0 bright.
     pub luma: f32,
     /// Bumped per static build and per captured live frame.
@@ -129,13 +136,13 @@ impl RawGlass {
     #[must_use]
     pub fn warp(&self, shape: GlassShape, luma: Option<f32>) -> Option<GlassBackdrop> {
         let shell = glass_optics::shell_rect(self.stage_width, shape, self.crop, self.image_scale);
-        let bevel_px = glass_optics::bevel_width(shape) * self.image_scale;
         let rgba = glass_optics::warp(
             &self.rgba,
             self.width,
             self.height,
             shell,
-            bevel_px,
+            self.image_scale,
+            self.page,
             glass_optics::FACE_BLUR_SIGMA,
         )?;
         let image = render_image_rgba(self.width, self.height, &rgba)?;
@@ -355,6 +362,8 @@ pub fn build_raw(
     let crop = crop_rect(left, top, right, bottom, (rect.0, rect.1), scale);
     #[allow(clippy::cast_precision_loss, reason = "pixel counts are far under 2^24")]
     let stage_width = rect.2 as f32 / scale;
+    #[allow(clippy::cast_precision_loss, reason = "display pixel counts are far under 2^24")]
+    let page = (display.0 as f32 / scale, display.1 as f32 / scale);
     Some(RawGlass {
         rgba: crop_raw,
         width: cw,
@@ -362,6 +371,7 @@ pub fn build_raw(
         crop,
         image_scale: scale,
         stage_width,
+        page,
         luma,
         generation: 0,
     })
@@ -506,6 +516,9 @@ pub(crate) fn crop_rect(
               before the narrowing cast"
 )]
 pub fn saturate(buffer: &mut [u8], factor: f32) {
+    if (factor - 1.0).abs() < f32::EPSILON {
+        return;
+    }
     for chunk in buffer.chunks_exact_mut(4) {
         let [r, g, b, ..] = *chunk else {
             continue;
@@ -845,6 +858,7 @@ mod tests {
             crop: Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 },
             image_scale: 1.0,
             stage_width: 420.0,
+            page: (1600.0, 900.0),
             luma: 0.4,
             generation: 7,
         };

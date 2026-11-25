@@ -1,7 +1,9 @@
 # 液态玻璃折射核心 —— 设计
 
 日期：2026-11-22
-状态：待评审（已按两轮评审修订）
+状态：已被取代。当前光学模型是 `dashersw/liquid-glass-js` 的 CPU 移植（见
+`src/glass_optics.rs` 顶部文档）：指数边缘/rim/边角/涟漪层、按页面像素位移、
+小幅高斯模糊，没有 bevel、Snell、色散、scrim、rim 或 sheen。本文保留为历史记录。
 
 ## 目标
 
