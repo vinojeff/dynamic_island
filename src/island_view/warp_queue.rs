@@ -157,6 +157,7 @@ mod tests {
             page: (1600.0, 900.0),
             luma: 0.5,
             generation,
+            flat: std::sync::OnceLock::new(),
         })
     }
 

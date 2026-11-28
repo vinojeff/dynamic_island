@@ -19,7 +19,7 @@
 //! This is the fallback path now: while live capture runs, the wallpaper is
 //! sampled at most once to seed the static slot.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use gpui_kit::RenderImage;
@@ -136,6 +136,10 @@ pub struct RawGlass {
     pub luma: f32,
     /// Bumped per static build and per captured live frame.
     pub generation: u64,
+    /// The plain crop, built on the first warp. The bytes never change for a
+    /// raw, so every warp of the same crop shares one texture instead of
+    /// rebuilding a copy per shape.
+    pub flat: OnceLock<Arc<RenderImage>>,
 }
 
 impl RawGlass {
@@ -158,16 +162,40 @@ impl RawGlass {
         let image = render_image_rgba(self.width, self.height, &rgba)?;
         // The refracted image is the blurred crop with its edge band bent;
         // outside the shell the two agree. The plain crop is the fallback for
-        // every other shape, so it stays untouched.
-        let flat = render_image_rgba(self.width, self.height, &self.rgba)?;
+        // every other shape, so it stays untouched. One raw has exactly one
+        // plain crop, so the texture is shared by every warp of it.
+        let flat = if let Some(flat) = self.flat.get() {
+            Arc::clone(flat)
+        } else {
+            let built = Arc::new(render_image_rgba(self.width, self.height, &self.rgba)?);
+            let _ = self.flat.set(Arc::clone(&built));
+            built
+        };
         Some(GlassBackdrop {
             image: Arc::new(image),
-            flat: Arc::new(flat),
+            flat,
             luma: luma.unwrap_or(self.luma),
             crop: self.crop,
             shape,
             generation: self.generation,
         })
+    }
+
+    /// Whether a warp of `other` still fits this crop.
+    ///
+    /// A new capture frame keeps the same geometry between morphs and slides;
+    /// only the pixels and the generation change. A warp baked from an older
+    /// frame of the same crop is still the right glass, so installing it is
+    /// better than dropping it and waiting another capture interval.
+    #[must_use]
+    pub fn same_geometry(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.crop == other.crop
+            && self.image_scale.to_bits() == other.image_scale.to_bits()
+            && self.stage_width.to_bits() == other.stage_width.to_bits()
+            && self.page.0.to_bits() == other.page.0.to_bits()
+            && self.page.1.to_bits() == other.page.1.to_bits()
     }
 }
 
@@ -389,6 +417,7 @@ pub fn build_raw(
         page,
         luma,
         generation: 0,
+        flat: OnceLock::new(),
     })
 }
 
@@ -864,19 +893,24 @@ mod tests {
         out
     }
 
-    #[test]
-    fn raw_glass_warp_carries_geometry_luma_and_generation() {
-        let raw = RawGlass {
+    fn small_raw(crop: Rect, generation: u64) -> RawGlass {
+        RawGlass {
             rgba: solid_rgba(4, 4, [40, 50, 60, 255]),
             width: 4,
             height: 4,
-            crop: Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 },
+            crop,
             image_scale: 1.0,
             stage_width: 420.0,
             page: (1600.0, 900.0),
             luma: 0.4,
-            generation: 7,
-        };
+            generation,
+            flat: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn raw_glass_warp_carries_geometry_luma_and_generation() {
+        let raw = small_raw(Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 }, 7);
         let shape = GlassShape { width: 2.0, height: 2.0, radius: 1.0 };
         let backdrop = raw.warp(shape, None).unwrap();
         assert_eq!(backdrop.crop, raw.crop);
@@ -897,5 +931,32 @@ mod tests {
         assert!(!Arc::ptr_eq(&backdrop.flat, &backdrop.image), "two images, one warp");
         let overridden = raw.warp(shape, Some(0.9)).unwrap();
         assert!((overridden.luma - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn same_geometry_ignores_pixels_luma_and_generation() {
+        let crop = Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 };
+        let first = small_raw(crop, 1);
+        let mut second = small_raw(crop, 9);
+        second.luma = 0.9;
+        if let Some(first_pixel) = second.rgba.first_mut() {
+            *first_pixel = 255;
+        }
+        assert!(first.same_geometry(&second), "content and luma are not geometry");
+        second.image_scale = 0.5;
+        assert!(!first.same_geometry(&second), "a rescaled crop cannot stand in");
+        second.image_scale = 1.0;
+        second.crop = Rect { x: 0.0, ..crop };
+        assert!(!first.same_geometry(&second), "a moved crop cannot stand in");
+    }
+
+    #[test]
+    fn one_raw_builds_its_plain_texture_once() {
+        let raw = small_raw(Rect { x: -2.0, y: -2.0, width: 8.0, height: 8.0 }, 1);
+        let shape = GlassShape { width: 2.0, height: 2.0, radius: 1.0 };
+        let first = raw.warp(shape, None).unwrap();
+        let second = raw.warp(shape, None).unwrap();
+        assert!(Arc::ptr_eq(&first.flat, &second.flat), "flat is per raw, not per warp");
+        assert!(!Arc::ptr_eq(&first.image, &second.image), "each warp bakes its own image");
     }
 }

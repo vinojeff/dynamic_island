@@ -174,11 +174,13 @@ pub(super) fn shell_shadows() -> Vec<BoxShadow> {
 
 /// The shell's underlay layers.
 ///
-/// A landed backdrop is the whole material, so there is nothing to paint over
-/// it. Before the first warp lands, a dark cool wash keeps the white ink
-/// readable on whatever wallpaper is behind the transparent window.
-pub(super) fn layers(radius: f32, glass: Option<&Arc<RenderImage>>) -> Vec<gpui_kit::Div> {
-    if glass.is_some() {
+/// A landed, shape-matching backdrop is the whole material, so there is
+/// nothing to paint over it. While the lens paints the plain fallback — before
+/// the first warp lands, or during a morph whose warp is still being baked — a
+/// dark cool wash keeps the white ink readable and keeps the shell reading as
+/// glass instead of a hole in the wallpaper.
+pub(super) fn layers(radius: f32, refracted: bool) -> Vec<gpui_kit::Div> {
+    if refracted {
         return Vec::new();
     }
     let lift = (0.10 + 0.08 * IDLE_LUMA).clamp(0.10, 0.18);
@@ -312,14 +314,19 @@ mod tests {
 
     #[test]
     fn a_landed_backdrop_needs_no_layers_over_it() {
-        let image = backdrop();
-        let layers = super::layers(CARD_RADIUS, Some(&image.image));
+        let layers = super::layers(CARD_RADIUS, true);
         assert!(layers.is_empty(), "the warp is the whole material");
     }
 
     #[test]
+    fn a_plain_fallback_keeps_the_wash_under_the_shell() {
+        let layers = super::layers(CARD_RADIUS, false);
+        assert_eq!(layers.len(), 1, "a flat crop still needs a glass body");
+    }
+
+    #[test]
     fn the_boot_wash_covers_the_shell_before_a_backdrop_lands() {
-        let layers = super::layers(CARD_RADIUS, None);
+        let layers = super::layers(CARD_RADIUS, false);
         assert_eq!(layers.len(), 1, "exactly one fallback wash");
         assert!(
             (CARD_WIDTH - 420.0).abs() < 0.01 && (CARD_HEIGHT - 288.0).abs() < 0.01,

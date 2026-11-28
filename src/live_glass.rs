@@ -11,7 +11,7 @@
 //! thread.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use windows_capture::capture::{
@@ -93,6 +93,10 @@ pub(crate) struct CropGeometry {
 pub(crate) struct CropSpec {
     pub geometry: CropGeometry,
     pub shape: GlassShape,
+    /// Whether the capture thread should bake a warp for this frame. False
+    /// while a morph is still moving: a warp baked now would be painted as the
+    /// plain crop anyway, so it would only burn a core the animation needs.
+    pub warp: bool,
 }
 
 impl CropSpec {
@@ -109,6 +113,7 @@ impl CropSpec {
             page: (0.0, 0.0),
         },
         shape: GlassShape::ZERO,
+        warp: false,
     };
 }
 
@@ -200,6 +205,7 @@ pub(crate) fn crop_spec(
             page,
         },
         shape,
+        warp: true,
     })
 }
 
@@ -675,10 +681,16 @@ impl GraphicsCaptureApiHandler for LiveHandler {
             page: spec.geometry.page,
             luma,
             generation,
+            flat: OnceLock::new(),
         });
         // The capture thread warps with the newest shape; the view re-warps
-        // the kept raw when only the shape moved.
-        let warped = raw.warp(spec.shape, None).map(Arc::new);
+        // the kept raw when only the shape moved. A moving morph is left
+        // unwarped: the paint side would show the plain crop anyway.
+        let warped = if spec.warp {
+            raw.warp(spec.shape, None).map(Arc::new)
+        } else {
+            None
+        };
         self.sink.publish(LiveFrame { raw, warped, generation, luma });
         Ok(())
     }
@@ -832,10 +844,12 @@ impl LiveGlass {
         stage: (i32, i32, u32, u32),
         scale: f32,
         shape: GlassShape,
+        warp: bool,
     ) -> bool {
-        let Some(spec) = crop_spec(stage, scale, wallpaper::screen_size(), shape) else {
+        let Some(mut spec) = crop_spec(stage, scale, wallpaper::screen_size(), shape) else {
             return false;
         };
+        spec.warp = warp;
         let mut slot = match self.spec.lock() {
             Ok(slot) => slot,
             Err(poison) => PoisonError::into_inner(poison),
@@ -963,12 +977,21 @@ mod tests {
     #[test]
     fn update_crop_only_reports_geometry_changes() {
         let mut live = LiveGlass::new();
-        assert!(live.update_crop((100, 0, 420, 360), 1.0, card_shape()));
-        assert!(!live.update_crop((100, 0, 420, 360), 1.0, card_shape()));
+        assert!(live.update_crop((100, 0, 420, 360), 1.0, card_shape(), true));
+        assert!(!live.update_crop((100, 0, 420, 360), 1.0, card_shape(), true));
         // Shape-only: the raw stays valid, so this is not a geometry change.
         let morphed = GlassShape { width: 320.0, height: 56.0, radius: 28.0 };
-        assert!(!live.update_crop((100, 0, 420, 360), 1.0, morphed));
-        assert!(live.update_crop((140, 0, 420, 360), 1.0, morphed));
+        assert!(!live.update_crop((100, 0, 420, 360), 1.0, morphed, true));
+        assert!(live.update_crop((140, 0, 420, 360), 1.0, morphed, true));
+    }
+
+    #[test]
+    fn update_crop_carries_the_warp_flag_without_reporting_geometry() {
+        let mut live = LiveGlass::new();
+        assert!(live.update_crop((100, 0, 420, 360), 1.0, card_shape(), false));
+        assert!(!live.spec.lock().unwrap().warp, "a moving morph does not warp");
+        assert!(!live.update_crop((100, 0, 420, 360), 1.0, card_shape(), true));
+        assert!(live.spec.lock().unwrap().warp, "a settled shape warps again");
     }
 
     #[test]

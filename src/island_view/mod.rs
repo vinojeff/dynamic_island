@@ -96,8 +96,9 @@ struct Face {
     sessions_open: bool,
     perf: PerfHistory,
     page_slide: f32,
-    /// The refracted wallpaper crop, when a build has landed.
-    glass: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    /// Whether the lens paints the refracted crop for this shape. `false`
+    /// means the plain fallback is on screen and the shell needs its wash.
+    lens_refracted: bool,
 }
 
 /// One morph already on screen, so the next animation knows where it starts.
@@ -194,8 +195,9 @@ pub struct IslandView {
     glass_luma: f32,
     /// The newest live crop, kept around for shape-only re-warps.
     last_live_raw: Option<std::sync::Arc<wallpaper::RawGlass>>,
-    /// The generation `last_live_raw` was captured under. `MAX` means none.
-    live_generation: u64,
+    /// The generation of the newest live backdrop actually installed. A warp
+    /// of the same crop from an older frame must not overwrite it.
+    live_glass_generation: u64,
     /// The previous backdrop, cross-faded out after a warp lands.
     fading_glass: Option<(std::sync::Arc<wallpaper::GlassBackdrop>, u64)>,
     /// Pending, in-flight, and failed glass warps. Install rules live in
@@ -272,7 +274,7 @@ impl IslandView {
             static_generation: 0,
             glass_luma: glass::IDLE_LUMA,
             last_live_raw: None,
-            live_generation: u64::MAX,
+            live_glass_generation: 0,
             fading_glass: None,
             warps: WarpQueue::default(),
             live: live_glass::LiveGlass::new(),
@@ -626,28 +628,24 @@ impl IslandView {
                     }
                 } else if request.dest == WarpDest::Live
                     && self.live.is_live()
-                    && request.generation == self.live_generation
+                    && self
+                        .last_live_raw
+                        .as_ref()
+                        .is_some_and(|raw| raw.same_geometry(&request.raw))
                 {
+                    // The crop still exists; only the pixels (and generation)
+                    // may have moved on. Dropping a 32 ms warp because a new
+                    // frame arrived first would just start the same bake again.
                     install = Some(backdrop);
                 }
                 if let Some(backdrop) = install {
-                    // Fade the new warp in only when it resolves a plain
-                    // fallback into the shape the shell has now: the old
-                    // backdrop was baked for another shape, so its plain crop
-                    // is on screen and blending the refraction over it hides
-                    // the cut. Two warps baked for the *same* shape are just
-                    // successive samples of the same glass — cross-fading
-                    // those would show the older sample for 120ms.
-                    let live = GlassShape::from(self.shown.shape.get());
-                    let old = self.glass.take();
-                    let old_plain = old
-                        .as_ref()
-                        .is_some_and(|old| !glass_optics::same_shape(old.shape, live));
-                    let resolves = glass_optics::same_shape(backdrop.shape, live) && old_plain;
-                    self.fading_glass =
-                        if resolves { old.map(|old| (old, millis_now())) } else { None };
+                    let backdrop = Arc::new(backdrop);
                     self.glass_luma = backdrop.luma;
-                    self.glass = Some(Arc::new(backdrop));
+                    if request.dest == WarpDest::Live {
+                        self.install_live_warp(backdrop, request.generation);
+                    } else {
+                        self.install_static_warp(backdrop);
+                    }
                     cx.notify();
                 }
                 // Stale or blocked completions install nothing.
@@ -657,6 +655,49 @@ impl IslandView {
             }
         }
         self.start_pending_warp(cx);
+    }
+
+    /// Installs a live warp unless it is baked for another shape or older than
+    /// the glass on screen. A matching warp replacing a plain fallback starts
+    /// the cross-fade; two warps of the same shape replace each other without
+    /// blending, because they are successive samples, not two materials.
+    fn install_live_warp(&mut self, backdrop: Arc<wallpaper::GlassBackdrop>, generation: u64) -> bool {
+        let live = self.live_shape();
+        let installed = self.glass.as_ref().map(|old| old.shape);
+        match live_install(
+            backdrop.shape,
+            live,
+            generation,
+            self.live_glass_generation,
+            installed,
+        ) {
+            LiveInstall::Skip => false,
+            LiveInstall::Replace => {
+                self.fading_glass = None;
+                self.glass = Some(backdrop);
+                self.live_glass_generation = generation;
+                true
+            }
+            LiveInstall::Fade => {
+                self.fading_glass = self.glass.take().map(|old| (old, millis_now()));
+                self.glass = Some(backdrop);
+                self.live_glass_generation = generation;
+                true
+            }
+        }
+    }
+
+    /// Installs a static (wallpaper) warp. The fallback has no frame cadence,
+    /// so it fades over the plain crop whenever it resolves one.
+    fn install_static_warp(&mut self, backdrop: Arc<wallpaper::GlassBackdrop>) {
+        let live = self.live_shape();
+        let old = self.glass.take();
+        let old_plain = old
+            .as_ref()
+            .is_some_and(|old| !glass_optics::same_shape(old.shape, live));
+        let resolves = glass_optics::same_shape(backdrop.shape, live) && old_plain;
+        self.fading_glass = if resolves { old.map(|old| (old, millis_now())) } else { None };
+        self.glass = Some(backdrop);
     }
 
     fn start_pending_warp(&mut self, cx: &mut Context<Self>) {
@@ -683,10 +724,31 @@ impl IslandView {
         true
     }
 
+    /// The shape the lens is painting right now: the morph frame while one is
+    /// in flight, the resting shape otherwise.
+    fn live_shape(&self) -> GlassShape {
+        match self.shown.motion.as_ref() {
+            Some(motion) => GlassShape::from(frame_shape(motion).0),
+            None => GlassShape::from(self.shown.shape.get()),
+        }
+    }
+
+    /// Whether the current morph is still far enough from its target that a
+    /// warp baked now would only ever be painted as the plain crop.
+    fn settling(&self) -> bool {
+        motion_settling(self.shown.motion.as_ref(), self.live_shape())
+    }
+
     /// Re-warps the newest raw whenever only the shape moved — the desktop
     /// did not change, so WGC will not send a frame.
     fn poll_warp(&mut self, cx: &mut Context<Self>) {
-        let shape = GlassShape::from(self.shown.shape.get());
+        // A warp baked while the shape is still moving would be painted as the
+        // plain crop anyway. Wait until the morph is within the match epsilon,
+        // then bake once for the shape that will stay on screen.
+        if self.settling() {
+            return;
+        }
+        let shape = self.live_shape();
         if self.live.is_live() {
             let Some(raw) = self.last_live_raw.clone() else {
                 return;
@@ -775,7 +837,7 @@ impl IslandView {
         self.glass_epoch = self.glass_epoch.saturating_add(1);
         self.glass_building = false;
         self.last_live_raw = None;
-        self.live_generation = u64::MAX;
+        self.live_glass_generation = 0;
         self.warps.clear_pending();
     }
 
@@ -856,19 +918,20 @@ impl IslandView {
         }
         let now = millis_now();
         let wanted = self.state != IslandState::Line && !self.hidden && !self.exclusive;
-        let shape = GlassShape::from(self.shown.shape.get());
+        let shape = self.live_shape();
+        let settled = !self.settling();
         // Always keep the crop current while live, even when collapsed: the
         // prewarm session and the first expand both need a valid rect before
         // `wanted` ever turns true. Unchanged specs are a cheap comparison.
         if let Some((x, y, width, height, scale)) = placed_stage(cx) {
-            if self.live.update_crop((x, y, width, height), scale, shape) {
+            if self.live.update_crop((x, y, width, height), scale, shape, settled) {
                 // Stale geometry cannot be re-warped: fall back to the wash
                 // until a frame with the new crop arrives. Clearing
                 // `static_glass` too lets the 2s poll rebuild the fallback
                 // for the new rect (poll_glass early-returns while live &&
                 // static_glass.is_some()).
                 self.last_live_raw = None;
-                self.live_generation = u64::MAX;
+                self.live_glass_generation = 0;
                 self.glass = None;
                 self.static_glass = None;
                 self.warps.clear_dest(WarpDest::Live);
@@ -901,18 +964,18 @@ impl IslandView {
         self.apply_live(action, cx);
         let mut changed = false;
         if let Some(frame) = frame {
-            self.live_generation = frame.generation;
             self.last_live_raw = Some(frame.raw);
             if (self.glass_luma - frame.luma).abs() > f32::EPSILON {
                 changed = true; // the scrim follows the smoothed luma
             }
             self.glass_luma = frame.luma;
             if let Some(warped) = frame.warped {
-                // A fresh live frame supersedes any running fade: blending
-                // video frames 120ms apart would ghost the desktop.
-                self.fading_glass = None;
-                self.glass = Some(warped);
-                changed = true;
+                // A matching warp may resolve the plain fallback; an older or
+                // mismatched one would only flip the panel back to flat, so
+                // `install_live_warp` decides.
+                if self.install_live_warp(warped, frame.generation) {
+                    changed = true;
+                }
             }
         }
         changed
@@ -1181,8 +1244,16 @@ impl IslandView {
             sessions_open: self.sessions_open,
             perf: self.perf.clone(),
             page_slide: self.page_slide,
-            glass: self.glass.as_ref().map(|backdrop| Arc::clone(&backdrop.image)),
+            lens_refracted: self.lens_refracted(self.shown.shape.get()),
         }
+    }
+
+    /// Whether the installed backdrop was baked for `shape`, so the lens
+    /// paints refraction rather than the plain crop.
+    fn lens_refracted(&self, shape: Morph) -> bool {
+        self.glass.as_ref().is_some_and(|backdrop| {
+            glass_optics::same_shape(backdrop.shape, GlassShape::from(shape))
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1269,23 +1340,21 @@ impl IslandView {
             let (shape, raw) = frame_shape(&motion);
             lens_shape = shape;
             if raw < 1.0 {
-                let ticket = generation;
-                cx.spawn(async move |view, cx| {
-                    cx.background_executor().timer(Duration::from_millis(16)).await;
-                    view.update(cx, |view, cx| {
-                        if view.generation == ticket {
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                })
-                .detach();
+                // The next shape is a pure function of the clock. Ask the
+                // platform for the next vsync instead of racing a 16 ms
+                // background timer against the warp executor.
+                window.request_animation_frame();
             } else {
                 self.shown.motion = None;
                 self.shown.shape.set(shape);
             }
             paint(
-                &Face { shape, state: motion.to, ..face_now.clone() },
+                &Face {
+                    shape,
+                    state: motion.to,
+                    lens_refracted: self.lens_refracted(shape),
+                    ..face_now.clone()
+                },
                 &card_clicks,
                 window,
                 press(&toggle),
@@ -1300,7 +1369,11 @@ impl IslandView {
             .into_any_element()
         } else {
             paint(
-                &Face { shape: island::resting(self.state), ..face_now.clone() },
+                &Face {
+                    shape: island::resting(self.state),
+                    lens_refracted: self.lens_refracted(island::resting(self.state)),
+                    ..face_now.clone()
+                },
                 &card_clicks,
                 window,
                 press(&toggle),
@@ -1626,6 +1699,39 @@ fn dispatch_transport(command: media::Transport, cx: &mut gpui_kit::Context<Isla
     .detach();
 }
 
+/// What a freshly baked live warp does to the glass on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveInstall {
+    /// Baked for another shape, or older than the glass already installed.
+    Skip,
+    /// Same shape as what is on screen: replace it, never blend two samples.
+    Replace,
+    /// Resolves a plain fallback: cross-fade the refraction in.
+    Fade,
+}
+
+fn live_install(
+    baked: GlassShape,
+    live: GlassShape,
+    generation: u64,
+    installed_generation: u64,
+    installed: Option<GlassShape>,
+) -> LiveInstall {
+    if !glass_optics::same_shape(baked, live) || generation < installed_generation {
+        return LiveInstall::Skip;
+    }
+    match installed {
+        Some(old) if !glass_optics::same_shape(old, live) => LiveInstall::Fade,
+        _ => LiveInstall::Replace,
+    }
+}
+
+fn motion_settling(motion: Option<&Motion>, current: GlassShape) -> bool {
+    motion.is_some_and(|motion| {
+        !glass_optics::same_shape(current, GlassShape::from(island::resting(motion.to)))
+    })
+}
+
 pub(super) fn millis_now() -> u64 {
     u64::try_from(
         std::time::SystemTime::now()
@@ -1924,4 +2030,52 @@ fn hold_ms(duration: Duration) -> u64 {
 fn press(click: &Click) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
     let click = Rc::clone(click);
     move |event, window, app| click(event, window, app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card() -> GlassShape {
+        GlassShape::from(island::resting(IslandState::Card))
+    }
+
+    fn morph_to(to: IslandState) -> Motion {
+        Motion { from: IslandState::Capsule, to, generation: 1, started_ms: 0 }
+    }
+
+    #[test]
+    fn a_morph_is_settling_until_the_shape_is_within_the_epsilon() {
+        let card = card();
+        let motion = morph_to(IslandState::Card);
+        let mid = GlassShape { width: card.width - 20.0, ..card };
+        let near = GlassShape { width: card.width + 0.4, ..card };
+        assert!(motion_settling(Some(&motion), mid), "20px out is still moving");
+        assert!(!motion_settling(Some(&motion), near), "sub-pixel counts as settled");
+        assert!(!motion_settling(None, mid), "at rest nothing is settling");
+    }
+
+    #[test]
+    fn live_install_skips_a_warp_baked_for_another_shape_or_an_older_frame() {
+        let card = card();
+        let mid = GlassShape { width: card.width - 20.0, ..card };
+        assert_eq!(live_install(mid, card, 5, 0, None), LiveInstall::Skip);
+        assert_eq!(live_install(card, card, 4, 5, Some(card)), LiveInstall::Skip);
+    }
+
+    #[test]
+    fn live_install_fades_a_matching_warp_over_a_plain_fallback() {
+        let card = card();
+        let mid = GlassShape { width: card.width - 20.0, ..card };
+        assert_eq!(live_install(card, card, 5, 0, Some(mid)), LiveInstall::Fade);
+        assert_eq!(live_install(card, card, 5, 0, None), LiveInstall::Replace);
+        assert_eq!(live_install(card, card, 5, 5, Some(card)), LiveInstall::Replace);
+    }
+
+    #[test]
+    fn a_sub_pixel_baked_shape_still_counts_as_matching() {
+        let card = card();
+        let nudged = GlassShape { width: card.width + 0.2, ..card };
+        assert_ne!(live_install(nudged, card, 5, 0, Some(card)), LiveInstall::Skip);
+    }
 }

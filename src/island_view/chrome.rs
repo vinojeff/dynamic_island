@@ -72,7 +72,7 @@ where
     let Face {
         shape, playing, tab, volume, volume_visible, bt_notice, state, notice, badge, media_line,
         media_playing, cover, progress, position_secs, duration_secs, track_hot, album_line,
-        transport, modes, sessions, seekable, sessions_open, perf, page_slide, glass,
+        transport, modes, sessions, seekable, sessions_open, perf, page_slide, lens_refracted,
     } = face.clone();
     let title = match notice.as_ref() {
         Some(item) => notice::marquee_text(item),
@@ -145,7 +145,7 @@ where
         .when(state != IslandState::Line, |shell| {
             shell
                 .shadow(super::glass::shell_shadows())
-                .children(super::glass::layers(shape.radius, glass.as_ref()))
+                .children(super::glass::layers(shape.radius, lens_refracted))
         })
         .child(body);
 

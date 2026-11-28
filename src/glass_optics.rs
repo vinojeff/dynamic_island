@@ -267,7 +267,39 @@ pub fn blur(rgba: &mut [u8], width: usize, height: usize, sigma: f32) {
     blur_pass(&temp, rgba, width, height, &kernel, total, false);
 }
 
+/// How many row chunks to split an image into.
+///
+/// Threading only pays for itself on a full-size crop; a small buffer (a test,
+/// or the tucked line) stays on one thread.
+fn worker_count(rows: usize) -> usize {
+    const MIN_ROWS_PER_WORKER: usize = 32;
+    if rows < 2 * MIN_ROWS_PER_WORKER {
+        return 1;
+    }
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    cpus.min(8).min(rows / MIN_ROWS_PER_WORKER).max(1)
+}
+
+/// Rounded division by the kernel total, via a reciprocal multiply-shift.
+///
+/// `(sum + total/2) / total` costs one integer division per channel per pixel
+/// — millions on a live crop, and the blur was the bulk of a warp. `recip` is
+/// `ceil(2^48 / total)`. The kernel always contains its 16384-weight centre
+/// tap, so `total >= 16384`, `recip <= 2^34`, and `sum < 255.5 * total < 2^28`
+/// keep the product inside `u64`. The rounding error is `sum * e / 2^48` with
+/// `e < total <= 802816`, which stays below 1, so the shift is exact.
+#[inline]
+#[allow(clippy::cast_possible_truncation, reason = "the quotient is at most 255")]
+fn div_round(sum: u32, total: u32, recip: u64) -> u8 {
+    let rounded = u64::from(sum) + u64::from(total / 2);
+    ((rounded * recip) >> 48) as u8
+}
+
 /// One separable pass: `horizontal` scans rows, else columns.
+///
+/// Both orientations produce one output row at a time, so the pass is split
+/// into row chunks that threads can own outright. The vertical pass walks tap
+/// rows contiguously, which also stops the old column-strided reads.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -283,28 +315,88 @@ fn blur_pass(
     total: u32,
     horizontal: bool,
 ) {
+    let recip = (1u64 << 48).div_ceil(u64::from(total));
+    let workers = worker_count(height);
+    let rows_per = height.div_ceil(workers);
+    let row_bytes = width * 4;
+    if workers == 1 {
+        blur_rows(src, dst, width, height, 0, kernel, total, recip, horizontal);
+        return;
+    }
+    std::thread::scope(|scope| {
+        for (chunk, y0) in dst
+            .chunks_mut(rows_per * row_bytes)
+            .zip((0..).step_by(rows_per))
+        {
+            scope.spawn(move || {
+                blur_rows(src, chunk, width, height, y0, kernel, total, recip, horizontal);
+            });
+        }
+    });
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "the row needs the full frame geometry; the tap weight times u8 \
+              stays in u32 and offsets are a few pixels"
+)]
+fn blur_rows(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    y0: usize,
+    kernel: &[u32],
+    total: u32,
+    recip: u64,
+    horizontal: bool,
+) {
     let radius = kernel.len() / 2;
-    let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
-    let last = line_len.saturating_sub(1) as i64;
-    for line in 0..lines {
-        for index in 0..line_len {
-            let mut sums = [0u32; 4];
+    let last_x = width.saturating_sub(1) as i64;
+    let last_y = height.saturating_sub(1) as i64;
+    if horizontal {
+        for (row_index, row) in dst.chunks_exact_mut(width * 4).enumerate() {
+            let y = y0 + row_index;
+            for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+                let mut sums = [0u32; 4];
+                for (tap, weight) in kernel.iter().enumerate() {
+                    let offset = tap as i64 - radius as i64;
+                    let sx = (x as i64 + offset).clamp(0, last_x) as usize;
+                    let base = (y * width + sx) * 4;
+                    if let Some(src_pixel) = src.get(base..base + 4) {
+                        for (sum, value) in sums.iter_mut().zip(src_pixel) {
+                            *sum += weight * u32::from(*value);
+                        }
+                    }
+                }
+                for (channel, sum) in pixel.iter_mut().zip(sums) {
+                    *channel = div_round(sum, total, recip);
+                }
+            }
+        }
+    } else {
+        let mut sums = vec![[0u32; 4]; width];
+        for (row_index, row) in dst.chunks_exact_mut(width * 4).enumerate() {
+            let y = y0 + row_index;
+            sums.fill([0u32; 4]);
             for (tap, weight) in kernel.iter().enumerate() {
                 let offset = tap as i64 - radius as i64;
-                let pos = (index as i64 + offset).clamp(0, last) as usize;
-                let (x, y) = if horizontal { (pos, line) } else { (line, pos) };
-                let base = (y * width + x) * 4;
-                if let Some(pixel) = src.get(base..base + 4) {
-                    for (sum, value) in sums.iter_mut().zip(pixel) {
-                        *sum += weight * u32::from(*value);
+                let sy = (y as i64 + offset).clamp(0, last_y) as usize;
+                let base = sy * width * 4;
+                if let Some(src_row) = src.get(base..base + width * 4) {
+                    for (sum, pixel) in sums.iter_mut().zip(src_row.chunks_exact(4)) {
+                        for (channel, value) in sum.iter_mut().zip(pixel) {
+                            *channel += weight * u32::from(*value);
+                        }
                     }
                 }
             }
-            let out_base =
-                if horizontal { (line * width + index) * 4 } else { (index * width + line) * 4 };
-            if let Some(pixel) = dst.get_mut(out_base..out_base + 4) {
-                for (channel, sum) in pixel.iter_mut().zip(sums) {
-                    *channel = ((sum + total / 2) / total) as u8;
+            for (pixel, sum) in row.chunks_exact_mut(4).zip(&sums) {
+                for (channel, &sum) in pixel.iter_mut().zip(sum) {
+                    *channel = div_round(sum, total, recip);
                 }
             }
         }
@@ -371,13 +463,52 @@ pub fn warp(
     if half.0 <= 0.0 || half.1 <= 0.0 {
         return Some(out);
     }
+    let workers = worker_count(height);
+    let rows_per = height.div_ceil(workers);
+    let row_bytes = width * 4;
+    if workers == 1 {
+        warp_rows(&blurred, &mut out, width, height, 0, shell, image_scale, page);
+    } else {
+        let src: &[u8] = &blurred;
+        std::thread::scope(|scope| {
+            for (chunk, y0) in out
+                .chunks_mut(rows_per * row_bytes)
+                .zip((0..).step_by(rows_per))
+            {
+                scope.spawn(move || {
+                    warp_rows(src, chunk, width, height, y0, shell, image_scale, page);
+                });
+            }
+        });
+    }
+    Some(out)
+}
+
+/// Warps the rows in `dst`, whose first row is `y0` in the full image.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    reason = "the optics need the full frame geometry; pixel counts fit f32"
+)]
+fn warp_rows(
+    blurred: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    y0: usize,
+    shell: Shell,
+    image_scale: f32,
+    page: (f32, f32),
+) {
+    let half = shell.half();
     let inv = 1.0 / image_scale;
     let half_logical = (half.0 * inv, half.1 * inv);
     let radius = shell.radius * inv;
     // The shell's center, not its top-left: `local` is centre-relative.
     let center = (shell.x * inv + half_logical.0, shell.y * inv + half_logical.1);
     let page = (page.0.abs(), page.1.abs());
-    for (y, row) in out.chunks_exact_mut(width * 4).enumerate() {
+    for (row_index, row) in dst.chunks_exact_mut(width * 4).enumerate() {
+        let y = y0 + row_index;
         for (x, chunk) in row.chunks_exact_mut(4).enumerate() {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
@@ -386,21 +517,15 @@ pub fn warp(
                 continue;
             };
             let sample = sample_bilinear(
-                &blurred,
+                blurred,
                 width,
                 height,
                 px + dx * image_scale,
                 py + dy * image_scale,
             );
-            if let [r, g, b, a] = chunk {
-                *r = sample[0];
-                *g = sample[1];
-                *b = sample[2];
-                *a = sample[3];
-            }
+            chunk.copy_from_slice(&sample);
         }
     }
-    Some(out)
 }
 
 /// Clamped bilinear RGBA sample.
@@ -796,5 +921,130 @@ mod tests {
         let mut short = vec![0u8; 3];
         blur(&mut short, 4, 4, 1.0);
         assert_eq!(short, vec![0u8; 3]);
+    }
+
+    /// The pre-change per-pixel division, kept as an oracle for the reciprocal
+    /// path. Written as a different code shape on purpose: if the two agree,
+    /// the shift is exact and the row chunking changed nothing.
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "a fixed-size test frame; the offsets are a few pixels"
+    )]
+    fn reference_pass(
+        src: &[u8],
+        dst: &mut [u8],
+        width: usize,
+        height: usize,
+        kernel: &[u32],
+        total: u32,
+        horizontal: bool,
+    ) {
+        let radius = kernel.len() / 2;
+        let (lines, line_len) = if horizontal { (height, width) } else { (width, height) };
+        let last = line_len.saturating_sub(1) as i64;
+        for line in 0..lines {
+            for index in 0..line_len {
+                let mut sums = [0u32; 4];
+                for (tap, weight) in kernel.iter().enumerate() {
+                    let offset = tap as i64 - radius as i64;
+                    let pos = (index as i64 + offset).clamp(0, last) as usize;
+                    let (x, y) = if horizontal { (pos, line) } else { (line, pos) };
+                    let base = (y * width + x) * 4;
+                    for (sum, value) in sums.iter_mut().zip(&src[base..base + 4]) {
+                        *sum += weight * u32::from(*value);
+                    }
+                }
+                let out_base = if horizontal {
+                    (line * width + index) * 4
+                } else {
+                    (index * width + line) * 4
+                };
+                for (channel, sum) in dst[out_base..out_base + 4].iter_mut().zip(sums) {
+                    *channel = ((sum + total / 2) / total) as u8;
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "the kernel weights are small and non-negative"
+    )]
+    fn reference_blur(rgba: &[u8], width: usize, height: usize, sigma: f32) -> Vec<u8> {
+        let sigma = sigma.min(8.0);
+        let radius = (sigma * 3.0).ceil() as i64;
+        let denom = 2.0 * sigma * sigma;
+        let mut kernel = Vec::new();
+        for step in -radius..=radius {
+            let distance = step as f32;
+            let weight = (-(distance * distance) / denom).exp();
+            kernel.push((weight * 16_384.0).round() as u32);
+        }
+        let total: u32 = kernel.iter().sum();
+        let mut out = rgba.to_vec();
+        let mut temp = vec![0u8; rgba.len()];
+        reference_pass(rgba, &mut temp, width, height, &kernel, total, true);
+        reference_pass(&temp, &mut out, width, height, &kernel, total, false);
+        out
+    }
+
+    #[allow(clippy::cast_possible_truncation, reason = "the modulo keeps the value in u8")]
+    fn noisy(width: usize, height: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                out.extend_from_slice(&[
+                    (x * 7 % 256) as u8,
+                    (y * 11 % 256) as u8,
+                    ((x + y) * 3 % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn blur_through_a_reciprocal_and_row_chunks_matches_the_division_oracle() {
+        let (width, height) = (160, 120);
+        let src = noisy(width, height);
+        let mut actual = src.clone();
+        blur(&mut actual, width, height, 1.5);
+        let expected = reference_blur(&src, width, height, 1.5);
+        assert_eq!(actual, expected, "the reciprocal shift must equal the division");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss, reason = "a 160x120 test frame fits f32")]
+    fn warp_through_row_chunks_matches_the_serial_loop() {
+        let (width, height) = (160, 120);
+        let src = noisy(width, height);
+        let shell = Shell { x: 10.0, y: 6.0, width: 140.0, height: 108.0, radius: 20.0 };
+        let actual = warp(&src, width, height, shell, 1.0, TEST_PAGE, 1.0).unwrap();
+
+        // The serial reference: the same optics, one pixel at a time.
+        let blurred = reference_blur(&src, width, height, 1.0);
+        let mut expected = blurred.clone();
+        let half = shell.half();
+        let radius = shell.radius;
+        let center = (shell.x + half.0, shell.y + half.1);
+        for (y, row) in expected.chunks_exact_mut(width * 4).enumerate() {
+            for (x, chunk) in row.chunks_exact_mut(4).enumerate() {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let local = (px - center.0, py - center.1);
+                let Some((dx, dy)) = refraction_offset(local, half, radius, TEST_PAGE) else {
+                    continue;
+                };
+                let sample = sample_bilinear(&blurred, width, height, px + dx, py + dy);
+                chunk.copy_from_slice(&sample);
+            }
+        }
+        assert_eq!(actual, expected, "row chunks must not shift a sample");
     }
 }
